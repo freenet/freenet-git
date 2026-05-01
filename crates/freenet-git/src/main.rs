@@ -450,7 +450,7 @@ fn rescue(url_str: &str, ws_url: Option<&str>, timeout: Duration) -> Result<()> 
                     manifest_hash,
                     total_size: _,
                     chunk_count: declared_count,
-                } => match rescue_chunked(&mut api, &pack_wasm, *manifest_hash, timeout).await {
+                } => match rescue_chunked(&ws, &pack_wasm, *manifest_hash, timeout).await {
                     Ok(n) => {
                         chunk_count += n;
                         println!("ok {bundle_label} (ChunkedPack, {n}/{declared_count} chunks)",);
@@ -496,38 +496,100 @@ async fn rescue_pack(
     Ok(())
 }
 
+/// Rescue a chunked-pack bundle. Each chunk is GET'd then re-PUT;
+/// chunks run in parallel across a small pool of WS connections
+/// (default 8, override via `FREENET_GIT_PARALLEL_OPS`) so a
+/// hundreds-of-chunks rescue is hours instead of overnight.
+///
+/// The first connection of the pool handles the manifest GET (single
+/// shot) and the manifest re-PUT at the end. Each chunk task takes
+/// exclusive use of one connection for the duration of its
+/// GET-then-PUT pair, so the host's per-connection request order is
+/// preserved.
 async fn rescue_chunked(
-    api: &mut freenet_stdlib::client_api::WebApi,
+    ws_url: &str,
     pack_wasm: &[u8],
     manifest_hash: [u8; 32],
     timeout: Duration,
 ) -> Result<usize> {
-    let manifest_bytes = wsclient::get_pack(api, pack_wasm, manifest_hash, timeout)
+    use futures::stream::StreamExt;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    // Open one connection up front to fetch the manifest. We need the
+    // chunk count to pick the pool size, and re-using this connection
+    // as the first pool member would require a different pool API; the
+    // manifest GET is one round-trip so a separate connection is cheap.
+    let mut bootstrap = wsclient::connect(ws_url)
+        .await
+        .context("connect to local node")?;
+    let manifest_bytes = wsclient::get_pack(&mut bootstrap, pack_wasm, manifest_hash, timeout)
         .await
         .with_context(|| format!("GET manifest {}", hex::encode(manifest_hash)))?;
+    drop(bootstrap);
+
     let manifest = freenet_git_types::chunked::ChunkedPackManifestV1::from_bytes(&manifest_bytes)
         .context("decode manifest")?;
+
+    let n = manifest.chunk_count;
+    let parallelism = freenet_git_cli::chunked::parallelism_from_env();
+    let want = parallelism.min((n as usize).max(1));
+
+    // Open the chunk pool. Same graceful-degradation policy as
+    // chunked.rs: if the local node refuses extras we proceed with
+    // however many we got.
+    let mut pool: Vec<Arc<Mutex<freenet_stdlib::client_api::WebApi>>> = Vec::with_capacity(want);
+    for _ in 0..want {
+        match wsclient::connect(ws_url).await {
+            Ok(c) => pool.push(Arc::new(Mutex::new(c))),
+            Err(e) if !pool.is_empty() => {
+                tracing::warn!(
+                    "opened {}/{} parallel WS connections for rescue; falling back: {e:#}",
+                    pool.len(),
+                    want,
+                );
+                break;
+            }
+            Err(e) => return Err(e).context("open at least one WS connection for rescue"),
+        }
+    }
+    let actual_parallelism = pool.len();
+
+    // Each task GETs then PUTs one chunk on its assigned connection.
+    let pack_wasm: Arc<Vec<u8>> = Arc::new(pack_wasm.to_vec());
+    let mut stream = futures::stream::iter(manifest.chunk_hashes.iter().copied().enumerate())
+        .map(|(i, chunk_hash)| {
+            let conn = pool[i % pool.len()].clone();
+            let pack_wasm = pack_wasm.clone();
+            async move {
+                let mut conn = conn.lock().await;
+                let bytes = wsclient::get_pack(&mut conn, &pack_wasm, chunk_hash, timeout)
+                    .await
+                    .with_context(|| {
+                        format!("GET chunk {}/{} ({})", i + 1, n, hex::encode(chunk_hash))
+                    })?;
+                wsclient::put_pack(&mut conn, (*pack_wasm).clone(), bytes, timeout)
+                    .await
+                    .with_context(|| format!("PUT chunk {}/{}", i + 1, n))?;
+                anyhow::Ok(())
+            }
+        })
+        .buffer_unordered(actual_parallelism);
+
     let mut rescued = 0usize;
-    for (i, chunk_hash) in manifest.chunk_hashes.iter().enumerate() {
-        let bytes = wsclient::get_pack(api, pack_wasm, *chunk_hash, timeout)
-            .await
-            .with_context(|| {
-                format!(
-                    "GET chunk {}/{} ({})",
-                    i + 1,
-                    manifest.chunk_count,
-                    hex::encode(chunk_hash)
-                )
-            })?;
-        wsclient::put_pack(api, pack_wasm.to_vec(), bytes, timeout)
-            .await
-            .with_context(|| format!("PUT chunk {}/{}", i + 1, manifest.chunk_count))?;
+    while let Some(result) = stream.next().await {
+        result?;
         rescued += 1;
     }
-    // Re-PUT the manifest itself.
-    wsclient::put_pack(api, pack_wasm.to_vec(), manifest_bytes, timeout)
-        .await
-        .context("PUT manifest")?;
+    drop(stream);
+
+    // Re-PUT the manifest itself on the first connection.
+    {
+        let mut conn = pool[0].lock().await;
+        wsclient::put_pack(&mut conn, (*pack_wasm).clone(), manifest_bytes, timeout)
+            .await
+            .context("PUT manifest")?;
+    }
     Ok(rescued)
 }
 
