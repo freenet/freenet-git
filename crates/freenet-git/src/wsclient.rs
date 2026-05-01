@@ -87,33 +87,62 @@ pub async fn put_contract(
             Ok(r) => r.map_err(|e| anyhow!("recv: {e}"))?,
             Err(_) => bail!("timed out waiting for PUT confirmation after {timeout:?}"),
         };
-        match response {
-            HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
-                if key != expected_key {
-                    bail!(
-                        "host returned key {} for PUT but we computed {}",
-                        key.id(),
-                        expected_key.id()
-                    );
-                }
-                return Ok(key);
+        match dispatch_put_response(response, &expected_key) {
+            PutDispatch::Success(key) => return Ok(key),
+            PutDispatch::Continue => {}
+        }
+    }
+}
+
+/// Outcome of inspecting one [`HostResponse`] against a Put's
+/// expected key. Pulled out so the per-message dispatch is unit
+/// testable without spinning up a real WebApi.
+#[derive(Debug)]
+enum PutDispatch {
+    /// Caller should return `Ok(key)` immediately.
+    Success(ContractKey),
+    /// Caller should skip and keep waiting on the recv loop.
+    Continue,
+}
+
+/// Decide what to do with the next message arriving on a put_contract
+/// recv loop. Skipping mismatched PutResponses (rather than bailing)
+/// handles the cross-op stale-response case (issue #9): if a previous
+/// put_pack on this same connection had to retry, the original
+/// attempt's response can arrive late and sit in the queue. The next
+/// put_contract on the connection would otherwise read that stale
+/// response. The other recv loops in this file (get_state,
+/// update_state) already skip on key mismatch; this branch used to
+/// bail and produce "host returned key X for PUT but we computed Y"
+/// errors that looked like host bugs but were actually our own
+/// queue cruft.
+fn dispatch_put_response(response: HostResponse, expected_key: &ContractKey) -> PutDispatch {
+    match response {
+        HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
+            if key.id() != expected_key.id() {
+                tracing::debug!(
+                    "ignoring stale PutResponse for unrelated key {} while waiting for {}",
+                    key.id(),
+                    expected_key.id(),
+                );
+                PutDispatch::Continue
+            } else {
+                PutDispatch::Success(key)
             }
-            HostResponse::ContractResponse(ContractResponse::UpdateNotification {
-                key, ..
-            }) => {
-                if key == expected_key {
-                    // Subscribe path: PUT was accepted, this is our own
-                    // initial state being relayed back. Treat as success.
-                    return Ok(key);
-                }
-                // Else: not for us; loop and keep waiting.
+        }
+        HostResponse::ContractResponse(ContractResponse::UpdateNotification { key, .. }) => {
+            if key.id() == expected_key.id() {
+                // Subscribe path: PUT was accepted, this is our own
+                // initial state being relayed back. Treat as success.
+                PutDispatch::Success(key)
+            } else {
+                PutDispatch::Continue
             }
-            HostResponse::Ok => {
-                return Ok(expected_key);
-            }
-            other => {
-                tracing::debug!(?other, "ignoring non-PUT response while waiting");
-            }
+        }
+        HostResponse::Ok => PutDispatch::Success(*expected_key),
+        other => {
+            tracing::debug!(?other, "ignoring non-PUT response while waiting");
+            PutDispatch::Continue
         }
     }
 }
@@ -452,5 +481,77 @@ mod tests {
         );
         let shortcut = contract_id_from_wasm_hash(&wasm_hash, &params_bytes);
         assert_eq!(full, shortcut);
+    }
+
+    /// Build a fresh ContractKey from a unique seed for tests.
+    fn test_key(seed: u8) -> ContractKey {
+        let wasm: Vec<u8> = vec![seed; 64];
+        let params: Vec<u8> = vec![seed ^ 0x55; 32];
+        ContractKey::from_params_and_code(Parameters::from(params), ContractCode::from(wasm))
+    }
+
+    #[test]
+    fn dispatch_put_response_returns_success_for_matching_put_response() {
+        let key = test_key(1);
+        let response = HostResponse::ContractResponse(ContractResponse::PutResponse { key });
+        match dispatch_put_response(response, &key) {
+            PutDispatch::Success(got) => assert_eq!(got.id(), key.id()),
+            PutDispatch::Continue => panic!("expected Success on matching PutResponse"),
+        }
+    }
+
+    #[test]
+    fn dispatch_put_response_continues_on_stale_put_response() {
+        // The regression case for #9: an earlier PutResponse for a
+        // different key sitting in the queue must not be mistaken for
+        // ours and must not error. The recv loop just keeps waiting.
+        let stale_key = test_key(1);
+        let our_key = test_key(2);
+        let response =
+            HostResponse::ContractResponse(ContractResponse::PutResponse { key: stale_key });
+        assert!(matches!(
+            dispatch_put_response(response, &our_key),
+            PutDispatch::Continue,
+        ));
+    }
+
+    #[test]
+    fn dispatch_put_response_treats_matching_update_notification_as_success() {
+        let key = test_key(3);
+        let response = HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+            key,
+            update: freenet_stdlib::prelude::UpdateData::State(
+                freenet_stdlib::prelude::State::from(vec![]).into_owned(),
+            ),
+        });
+        assert!(matches!(
+            dispatch_put_response(response, &key),
+            PutDispatch::Success(_),
+        ));
+    }
+
+    #[test]
+    fn dispatch_put_response_skips_unrelated_update_notification() {
+        let our_key = test_key(4);
+        let other_key = test_key(5);
+        let response = HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+            key: other_key,
+            update: freenet_stdlib::prelude::UpdateData::State(
+                freenet_stdlib::prelude::State::from(vec![]).into_owned(),
+            ),
+        });
+        assert!(matches!(
+            dispatch_put_response(response, &our_key),
+            PutDispatch::Continue,
+        ));
+    }
+
+    #[test]
+    fn dispatch_put_response_treats_host_ok_as_success() {
+        let key = test_key(6);
+        assert!(matches!(
+            dispatch_put_response(HostResponse::Ok, &key),
+            PutDispatch::Success(_),
+        ));
     }
 }
