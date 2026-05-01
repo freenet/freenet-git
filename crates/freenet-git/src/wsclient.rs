@@ -46,13 +46,19 @@ pub async fn connect(url: &str) -> Result<WebApi> {
 /// for the Phase 1 single-node demo `PutResponse` is the success signal.
 pub async fn put_contract(
     web_api: &mut WebApi,
-    wasm_bytes: Vec<u8>,
+    wasm_bytes: &[u8],
     parameters_bytes: Vec<u8>,
     state_bytes: Vec<u8>,
     timeout: Duration,
 ) -> Result<ContractKey> {
     let parameters = Parameters::from(parameters_bytes);
-    let code = ContractCode::from(wasm_bytes);
+    // Clone the WASM bytes once at the boundary into the owned
+    // ContractCode the host wire format requires. Callers therefore
+    // hand us a borrow and we pay one allocation per attempt
+    // (matches the historical retry loop's clone-per-attempt cost,
+    // and lets parallel-chunked publish/fetch share one Arc<Vec<u8>>
+    // across N chunk tasks instead of deep-cloning per chunk).
+    let code = ContractCode::from(wasm_bytes.to_vec());
     let expected_key = ContractKey::from_params_and_code(parameters.clone(), &code);
 
     let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
@@ -416,7 +422,7 @@ pub async fn update_state(
 /// re-PUT of identical canonical bytes.
 pub async fn put_pack(
     web_api: &mut WebApi,
-    pack_wasm: Vec<u8>,
+    pack_wasm: &[u8],
     pack_bytes: Vec<u8>,
     timeout: Duration,
 ) -> Result<ContractKey> {
@@ -426,7 +432,7 @@ pub async fn put_pack(
     for attempt in 1..=MAX_ATTEMPTS {
         match put_contract(
             web_api,
-            pack_wasm.clone(),
+            pack_wasm,
             pack_hash.to_vec(),
             pack_bytes.clone(),
             timeout,

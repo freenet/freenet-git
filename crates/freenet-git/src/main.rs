@@ -335,7 +335,7 @@ fn create_repo(
             let mut api = wsclient::connect(&ws_url).await?;
             wsclient::put_contract(
                 &mut api,
-                repo_wasm,
+                &repo_wasm,
                 params.to_bytes(),
                 initial_state.to_bytes(),
                 publish_timeout,
@@ -490,7 +490,7 @@ async fn rescue_pack(
     let bytes = wsclient::get_pack(api, pack_wasm, pack_hash, timeout)
         .await
         .with_context(|| format!("GET pack {}", hex::encode(pack_hash)))?;
-    wsclient::put_pack(api, pack_wasm.to_vec(), bytes, timeout)
+    wsclient::put_pack(api, pack_wasm, bytes, timeout)
         .await
         .with_context(|| format!("PUT pack {}", hex::encode(pack_hash)))?;
     Ok(())
@@ -572,7 +572,7 @@ async fn rescue_chunked(
                     .with_context(|| {
                         format!("GET chunk {}/{} ({})", i + 1, n, hex::encode(chunk_hash))
                     })?;
-                wsclient::put_pack(&mut conn, (*pack_wasm).clone(), bytes, timeout)
+                wsclient::put_pack(&mut conn, &pack_wasm, bytes, timeout)
                     .await
                     .with_context(|| format!("PUT chunk {}/{}", i + 1, n))?;
                 anyhow::Ok(())
@@ -590,7 +590,7 @@ async fn rescue_chunked(
     // Re-PUT the manifest itself on the first connection.
     {
         let mut conn = pool[0].lock().await;
-        wsclient::put_pack(&mut conn, (*pack_wasm).clone(), manifest_bytes, timeout)
+        wsclient::put_pack(&mut conn, &pack_wasm, manifest_bytes, timeout)
             .await
             .context("PUT manifest")?;
     }

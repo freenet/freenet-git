@@ -192,13 +192,11 @@ where
     // without inter-chunk contention as long as `buffer_unordered`'s
     // concurrency cap matches `conns.len()`.
 
-    // Wrap the WASM blob in Arc so phase 2 chunk tasks can hand
-    // `&pack_wasm` to wsclient::get_pack (which takes `&[u8]`) at
-    // refcount cost rather than per-chunk deep-clone. Phase 1 still
-    // deep-clones inside the closure because wsclient::put_pack
-    // consumes `Vec<u8>` so it can re-use the bytes across its
-    // internal retry attempts; eliminating that would require
-    // reworking put_pack's signature.
+    // Wrap the WASM blob in Arc so chunk tasks share one allocation
+    // across both phases (refcount bump per task instead of deep
+    // clone). Both put_pack and get_pack take `&[u8]`, so the Arc
+    // hands out `&pack_wasm` directly. The wsclient layer clones
+    // internally only on retry, scoped to put_contract's lifetime.
     let pack_wasm = Arc::new(pack_wasm);
 
     // Phase 1: PUT every chunk in parallel.
@@ -206,10 +204,10 @@ where
     let mut put_stream = futures::stream::iter(chunks.into_iter().enumerate())
         .map(|(i, chunk)| {
             let conn = conns[i % conns.len()].clone();
-            let pack_wasm = (*pack_wasm).clone();
+            let pack_wasm = pack_wasm.clone();
             async move {
                 let mut conn = conn.lock().await;
-                wsclient::put_pack(&mut conn, pack_wasm, chunk, timeout_per_op)
+                wsclient::put_pack(&mut conn, &pack_wasm, chunk, timeout_per_op)
                     .await
                     .with_context(|| format!("PUT chunk {i}"))?;
                 anyhow::Ok(())
@@ -266,7 +264,7 @@ where
         let mut conn = conns[0].lock().await;
         wsclient::put_pack(
             &mut conn,
-            (*pack_wasm).clone(),
+            &pack_wasm,
             manifest_bytes.clone(),
             timeout_per_op,
         )
