@@ -150,7 +150,20 @@ fn dispatch_put_response(response: HostResponse, expected_key: &ContractKey) -> 
                 PutDispatch::Continue
             }
         }
-        HostResponse::Ok => PutDispatch::Success(*expected_key),
+        HostResponse::Ok => {
+            // Pre-existing arm: the host may emit a bare Ok rather
+            // than a typed response in some edge paths. We treat it
+            // as success because the original put_contract did, but
+            // this is the one branch where we can't verify the Ok
+            // belongs to *our* request (it has no key). If the queue
+            // had a stale Ok from a prior unrelated op, that would
+            // produce a false success here. Tightening to require a
+            // typed PutResponse/UpdateNotification with key match
+            // would need a survey of host code paths to confirm
+            // PUTs never legitimately resolve via bare Ok; deferred
+            // until we have txn-id correlation (the stdlib-side fix).
+            PutDispatch::Success(*expected_key)
+        }
         other => {
             tracing::debug!(?other, "ignoring non-PUT response while waiting");
             PutDispatch::Continue
@@ -563,6 +576,23 @@ mod tests {
         assert!(matches!(
             dispatch_put_response(HostResponse::Ok, &key),
             PutDispatch::Success(_),
+        ));
+    }
+
+    #[test]
+    fn dispatch_put_response_continues_on_unrelated_contract_response() {
+        // Defends against silently swallowing a brand-new ContractResponse
+        // variant. SubscribeResponse for an unrelated key should be
+        // skipped, not mistaken for our PUT confirmation.
+        let our_key = test_key(7);
+        let other_key = test_key(8);
+        let response = HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+            key: other_key,
+            subscribed: true,
+        });
+        assert!(matches!(
+            dispatch_put_response(response, &our_key),
+            PutDispatch::Continue,
         ));
     }
 }
