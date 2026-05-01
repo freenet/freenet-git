@@ -371,14 +371,15 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
                         human_bytes(*total_size),
                     );
                     let bytes = freenet_git_cli::chunked::fetch_chunked_pack_with_progress(
-                        &mut api,
+                        &env.ws_url,
                         &pack_wasm,
                         *manifest_hash,
                         *total_size,
                         *chunk_count,
+                        freenet_git_cli::chunked::parallelism_from_env(),
                         ws_timeout(),
-                        |chunk_i, chunk_n, _hash| {
-                            eprintln!("        chunk {chunk_i}/{chunk_n}");
+                        |done, chunk_n| {
+                            eprintln!("        chunk {done}/{chunk_n}");
                         },
                     )
                     .await
@@ -592,10 +593,11 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
                     human_bytes(pack_bytes.len() as u64),
                 );
                 let published = freenet_git_cli::chunked::publish_chunked_pack_with_progress(
-                    &mut api,
+                    &env.ws_url,
                     pack_wasm.clone(),
                     pack_bytes.clone(),
                     chunk_size,
+                    freenet_git_cli::chunked::parallelism_from_env(),
                     ws_timeout(),
                     |phase, i, n| {
                         use freenet_git_cli::chunked::PublishPhase;

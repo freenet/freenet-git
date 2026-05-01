@@ -5,3 +5,7 @@ Cargo.lock.bak
 .vscode/
 *.iml
 .DS_Store
+# Per-machine .cargo dirs and symlinks-to-them used to share a target
+# directory across worktrees (see https://github.com/freenet/freenet-git
+# layout convention: each worktree's .cargo links to main/.cargo).
+.cargo
