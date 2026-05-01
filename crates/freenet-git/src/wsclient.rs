@@ -111,11 +111,22 @@ enum PutDispatch {
 /// put_pack on this same connection had to retry, the original
 /// attempt's response can arrive late and sit in the queue. The next
 /// put_contract on the connection would otherwise read that stale
-/// response. The other recv loops in this file (get_state,
+/// buffered message. The other recv loops in this file (get_state,
 /// update_state) already skip on key mismatch; this branch used to
 /// bail and produce "host returned key X for PUT but we computed Y"
 /// errors that looked like host bugs but were actually our own
-/// queue cruft.
+/// queue residue.
+///
+/// Comparison is by `ContractKey::id()` only, matching the convention
+/// in `get_state` / `update_state`. `ContractKey`'s own `PartialEq`
+/// is also id-only (the `code: CodeHash` field is ignored), so this
+/// is the same equality the original `key != expected_key` check used.
+///
+/// Tradeoff: silently continuing on mismatch turns the rare "wrong
+/// key" case into a slower "wait for the real response, possibly
+/// timeout" path. If the real response truly never arrives, the
+/// caller hits its `timeout` deadline rather than a fast-fail bail.
+/// We accept this for parity with the get/update loops.
 fn dispatch_put_response(response: HostResponse, expected_key: &ContractKey) -> PutDispatch {
     match response {
         HostResponse::ContractResponse(ContractResponse::PutResponse { key }) => {
