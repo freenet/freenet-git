@@ -324,9 +324,6 @@ Not yet supported:
   namespace; it's a search engine over published repos plus a
   reputation signal so people can tell which `freenet-core` is
   the one they want.
-- **Parallel chunk uploads.** Pushing repos with hundreds of chunks
-  is currently slow (filed; not yet shipped).
-
 ## Roadmap
 
 The goal is a decentralized software forge, built incrementally:
