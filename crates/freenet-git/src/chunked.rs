@@ -162,19 +162,23 @@ where
     let actual_parallelism = parallelism.min(n as usize).max(1);
     let conns = open_pool(ws_url, actual_parallelism).await?;
 
+    // Share the WASM blob across chunk tasks via Arc so phase 2 (which
+    // only borrows it) doesn't deep-clone per chunk. Phase 1 still has
+    // to deep-clone because put_pack consumes Vec<u8> for retries.
+    let pack_wasm = Arc::new(pack_wasm);
+
     // Phase 1: PUT every chunk in parallel.
     let mut completed: u32 = 0;
-    let mut put_stream = futures::stream::iter(chunks.iter().enumerate())
+    let mut put_stream = futures::stream::iter(chunks.into_iter().enumerate())
         .map(|(i, chunk)| {
             let conn = conns[i % conns.len()].clone();
-            let pack_wasm = pack_wasm.clone();
-            let chunk = chunk.clone();
+            let pack_wasm = (*pack_wasm).clone();
             async move {
-                let mut g = conn.lock().await;
-                wsclient::put_pack(&mut g, pack_wasm, chunk, timeout_per_op)
+                let mut conn = conn.lock().await;
+                wsclient::put_pack(&mut conn, pack_wasm, chunk, timeout_per_op)
                     .await
                     .with_context(|| format!("PUT chunk {i}"))?;
-                Ok::<_, anyhow::Error>(())
+                anyhow::Ok(())
             }
         })
         .buffer_unordered(actual_parallelism);
@@ -193,10 +197,11 @@ where
                 let conn = conns[i % conns.len()].clone();
                 let pack_wasm = pack_wasm.clone();
                 async move {
-                    let mut g = conn.lock().await;
-                    let got = wsclient::get_pack(&mut g, &pack_wasm, expected_hash, timeout_per_op)
-                        .await
-                        .with_context(|| format!("re-GET chunk {i} for verification"))?;
+                    let mut conn = conn.lock().await;
+                    let got =
+                        wsclient::get_pack(&mut conn, &pack_wasm, expected_hash, timeout_per_op)
+                            .await
+                            .with_context(|| format!("re-GET chunk {i} for verification"))?;
                     let got_hash = *blake3::hash(&got).as_bytes();
                     if got_hash != expected_hash {
                         bail!(
@@ -205,7 +210,7 @@ where
                             hex_lower(&expected_hash),
                         );
                     }
-                    Ok::<_, anyhow::Error>(())
+                    anyhow::Ok(())
                 }
             })
             .buffer_unordered(actual_parallelism);
@@ -221,10 +226,10 @@ where
     let manifest_bytes = manifest.to_bytes();
     let manifest_hash = *blake3::hash(&manifest_bytes).as_bytes();
     {
-        let mut g = conns[0].lock().await;
+        let mut conn = conns[0].lock().await;
         wsclient::put_pack(
-            &mut g,
-            pack_wasm.clone(),
+            &mut conn,
+            (*pack_wasm).clone(),
             manifest_bytes.clone(),
             timeout_per_op,
         )
@@ -235,8 +240,8 @@ where
     // Phase 4: re-GET the manifest and verify byte-for-byte.
     on_step(PublishPhase::VerifyManifest, 1, 1);
     let got_manifest = {
-        let mut g = conns[0].lock().await;
-        wsclient::get_pack(&mut g, &pack_wasm, manifest_hash, timeout_per_op)
+        let mut conn = conns[0].lock().await;
+        wsclient::get_pack(&mut conn, &pack_wasm, manifest_hash, timeout_per_op)
             .await
             .context("re-GET manifest for verification")?
     };
@@ -323,8 +328,8 @@ where
     let conns = open_pool(ws_url, actual_parallelism).await?;
 
     let manifest_bytes = {
-        let mut g = conns[0].lock().await;
-        wsclient::get_pack(&mut g, pack_wasm, manifest_hash, timeout_per_op)
+        let mut conn = conns[0].lock().await;
+        wsclient::get_pack(&mut conn, pack_wasm, manifest_hash, timeout_per_op)
             .await
             .context("GET manifest")?
     };
@@ -350,19 +355,23 @@ where
 
     // Phase 4: parallel chunk GETs. Reassemble in manifest order.
     let n = manifest.chunk_count;
-    let mut received: Vec<Option<Vec<u8>>> = (0..n as usize).map(|_| None).collect();
+    let mut received: Vec<Option<Vec<u8>>> = vec![None; n as usize];
     let chunk_lens: Vec<u64> = (0..n).map(|i| manifest.chunk_len(i)).collect();
+    // Share the WASM blob across chunk tasks via Arc so each task only
+    // bumps a refcount instead of deep-cloning the WASM bytes.
+    let pack_wasm: Arc<Vec<u8>> = Arc::new(pack_wasm.to_vec());
     let mut completed: u32 = 0;
     let mut get_stream = futures::stream::iter(manifest.chunk_hashes.iter().copied().enumerate())
         .map(|(i, expected_hash)| {
             let conn = conns[i % conns.len()].clone();
-            let pack_wasm = pack_wasm.to_vec();
+            let pack_wasm = pack_wasm.clone();
             let expected_len = chunk_lens[i];
             async move {
-                let mut g = conn.lock().await;
-                let chunk = wsclient::get_pack(&mut g, &pack_wasm, expected_hash, timeout_per_op)
-                    .await
-                    .with_context(|| format!("GET chunk {i}"))?;
+                let mut conn = conn.lock().await;
+                let chunk =
+                    wsclient::get_pack(&mut conn, &pack_wasm, expected_hash, timeout_per_op)
+                        .await
+                        .with_context(|| format!("GET chunk {i}"))?;
                 if (chunk.len() as u64) != expected_len {
                     bail!(
                         "chunk {i} length {} disagrees with manifest expectation {}",
@@ -370,7 +379,7 @@ where
                         expected_len,
                     );
                 }
-                Ok::<_, anyhow::Error>((i, chunk))
+                anyhow::Ok((i, chunk))
             }
         })
         .buffer_unordered(actual_parallelism);
@@ -382,8 +391,7 @@ where
     }
     drop(get_stream);
 
-    let assembled = assemble_chunks(received, manifest.total_size)?;
-    Ok(assembled)
+    assemble_chunks(received, manifest.total_size)
 }
 
 /// Concatenate per-chunk byte vectors in manifest order. Errors if any
@@ -410,10 +418,9 @@ fn assemble_chunks(received: Vec<Option<Vec<u8>>>, expected_total_size: u64) -> 
 /// connections are wrapped in `Arc<Mutex<...>>` so chunk futures can
 /// take exclusive access for the duration of one PUT or GET.
 async fn open_pool(ws_url: &str, n: usize) -> Result<Vec<Arc<Mutex<WebApi>>>> {
-    let conns =
-        futures::future::try_join_all((0..n).map(|_| async { wsclient::connect(ws_url).await }))
-            .await
-            .context("open parallel WS connections")?;
+    let conns = futures::future::try_join_all((0..n).map(|_| wsclient::connect(ws_url)))
+        .await
+        .context("open parallel WS connections")?;
     Ok(conns.into_iter().map(|c| Arc::new(Mutex::new(c))).collect())
 }
 
