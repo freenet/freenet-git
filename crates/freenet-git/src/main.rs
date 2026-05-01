@@ -501,11 +501,15 @@ async fn rescue_pack(
 /// (default 8, override via `FREENET_GIT_PARALLEL_OPS`) so a
 /// hundreds-of-chunks rescue is hours instead of overnight.
 ///
-/// The first connection of the pool handles the manifest GET (single
-/// shot) and the manifest re-PUT at the end. Each chunk task takes
-/// exclusive use of one connection for the duration of its
-/// GET-then-PUT pair, so the host's per-connection request order is
-/// preserved.
+/// A separate one-shot bootstrap connection handles the manifest GET
+/// (we need the chunk count to size the pool, and re-using this
+/// connection as pool member 0 would require pool-construction API
+/// contortion; one extra round-trip per bundle is cheap). The chunk
+/// pool then drives the per-chunk GET-then-PUT pairs in parallel,
+/// and the manifest re-PUT lands on the first chunk-pool connection
+/// at the end. Each chunk task takes exclusive use of one connection
+/// for the duration of its GET-then-PUT pair, so the host's
+/// per-connection request order is preserved.
 async fn rescue_chunked(
     ws_url: &str,
     pack_wasm: &[u8],
