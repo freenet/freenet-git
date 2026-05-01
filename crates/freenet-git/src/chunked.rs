@@ -123,7 +123,7 @@ pub enum PublishPhase {
 /// via [`publish_chunked_pack_with_progress`].
 pub async fn publish_chunked_pack(
     ws_url: &str,
-    pack_wasm: Vec<u8>,
+    pack_wasm: &[u8],
     pack_bytes: Vec<u8>,
     chunk_size: u32,
     timeout_per_op: Duration,
@@ -148,7 +148,7 @@ pub async fn publish_chunked_pack(
 #[allow(clippy::too_many_arguments)]
 pub async fn publish_chunked_pack_with_progress<F>(
     ws_url: &str,
-    pack_wasm: Vec<u8>,
+    pack_wasm: &[u8],
     pack_bytes: Vec<u8>,
     chunk_size: u32,
     parallelism: usize,
@@ -195,9 +195,11 @@ where
     // Wrap the WASM blob in Arc so chunk tasks share one allocation
     // across both phases (refcount bump per task instead of deep
     // clone). Both put_pack and get_pack take `&[u8]`, so the Arc
-    // hands out `&pack_wasm` directly. The wsclient layer clones
-    // internally only on retry, scoped to put_contract's lifetime.
-    let pack_wasm = Arc::new(pack_wasm);
+    // hands out `&pack_wasm` directly. wsclient::put_contract clones
+    // once per retry attempt; that cost is unchanged from the
+    // pre-borrow signature (the previous caller cloned per attempt
+    // too).
+    let pack_wasm = Arc::new(pack_wasm.to_vec());
 
     // Phase 1: PUT every chunk in parallel.
     let mut puts_completed: u32 = 0;

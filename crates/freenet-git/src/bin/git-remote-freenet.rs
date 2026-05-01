@@ -596,7 +596,7 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
                 );
                 let published = freenet_git_cli::chunked::publish_chunked_pack_with_progress(
                     &env.ws_url,
-                    pack_wasm.clone(),
+                    &pack_wasm,
                     pack_bytes.clone(),
                     chunk_size,
                     freenet_git_cli::chunked::parallelism_from_env(),
