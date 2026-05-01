@@ -344,8 +344,9 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
         let total_bundles = state.object_index.len();
         let total_size: u64 = state.object_index.values().map(bundle_size).sum();
         eprintln!(
-            "==> {total_bundles} bundle(s), {} total (~60s per chunk under load)",
+            "==> {total_bundles} bundle(s), {} total (~60s per chunk under load; up to {} in parallel)",
             human_bytes(total_size),
+            freenet_git_cli::chunked::parallelism_from_env(),
         );
 
         for (i, record) in state.object_index.values().enumerate() {
@@ -589,8 +590,9 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
             } else {
                 let total_chunks = (pack_bytes.len() as u64).div_ceil(chunk_size as u64);
                 eprintln!(
-                    "==> publishing {} pack as {total_chunks} chunks (~60s per chunk under load)",
+                    "==> publishing {} pack as {total_chunks} chunks (~60s per chunk under load; up to {} in parallel)",
                     human_bytes(pack_bytes.len() as u64),
+                    freenet_git_cli::chunked::parallelism_from_env(),
                 );
                 let published = freenet_git_cli::chunked::publish_chunked_pack_with_progress(
                     &env.ws_url,

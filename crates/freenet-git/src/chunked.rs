@@ -27,6 +27,15 @@
 //! round-robin (`chunk_index % N`). The manifest PUT and re-GET use
 //! the first connection because they are single-shot.
 //!
+//! The round-robin assignment assumes per-chunk latency is roughly
+//! uniform. If one chunk on connection `k` takes much longer than
+//! its siblings, every chunk where `i % N == k` queues behind it,
+//! so the realized speedup degrades from N-way toward 1-way for
+//! that subset. This is acceptable for content-addressed PUT/GET
+//! (where most chunks are similar size and the bottleneck is per-op
+//! network confirmation) but worth noting if a future change makes
+//! per-chunk costs more variable.
+//!
 //! See [`docs/0001-large-repos.md`](../../../../docs/0001-large-repos.md)
 //! for the full design.
 
@@ -53,8 +62,15 @@ pub const DEFAULT_PARALLEL_OPS: usize = 8;
 /// non-integer falls back to the default; a serial run can be forced
 /// with `FREENET_GIT_PARALLEL_OPS=1`.
 pub fn parallelism_from_env() -> usize {
-    std::env::var("FREENET_GIT_PARALLEL_OPS")
-        .ok()
+    parse_parallelism(std::env::var("FREENET_GIT_PARALLEL_OPS").as_deref().ok())
+}
+
+/// Pure parser for `FREENET_GIT_PARALLEL_OPS`. Split out from
+/// [`parallelism_from_env`] so unit tests can exercise it without
+/// mutating process-wide environment variables (which is `unsafe` to
+/// do concurrently).
+fn parse_parallelism(value: Option<&str>) -> usize {
+    value
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_PARALLEL_OPS)
@@ -159,16 +175,34 @@ where
         .context("manifest self-check before publish")?;
 
     let n = manifest.chunk_count;
-    let actual_parallelism = parallelism.min(n as usize).max(1);
-    let conns = open_pool(ws_url, actual_parallelism).await?;
+    // Open the pool first; `open_pool` may return fewer connections
+    // than requested (graceful degradation). Use the actual pool size
+    // as the parallelism for `buffer_unordered` so we never schedule
+    // more concurrent ops than connections.
+    let conns = open_pool(ws_url, parallelism.min((n as usize).max(1))).await?;
+    let actual_parallelism = conns.len();
 
-    // Share the WASM blob across chunk tasks via Arc so phase 2 (which
-    // only borrows it) doesn't deep-clone per chunk. Phase 1 still has
-    // to deep-clone because put_pack consumes Vec<u8> for retries.
+    // INVARIANT: chunks are dispatched to connections by `i % conns.len()`,
+    // and `buffer_unordered(actual_parallelism)` schedules at most
+    // `conns.len()` futures concurrently while pulling from the iterator
+    // in strict order. Together these guarantee that the first `N` futures
+    // map 1:1 to the `N` connections, and each subsequent future does not
+    // start until a sibling on its assigned connection has finished and
+    // released the mutex. So the round-robin gives us full parallelism
+    // without inter-chunk contention as long as `buffer_unordered`'s
+    // concurrency cap matches `conns.len()`.
+
+    // Wrap the WASM blob in Arc so phase 2 chunk tasks can hand
+    // `&pack_wasm` to wsclient::get_pack (which takes `&[u8]`) at
+    // refcount cost rather than per-chunk deep-clone. Phase 1 still
+    // deep-clones inside the closure because wsclient::put_pack
+    // consumes `Vec<u8>` so it can re-use the bytes across its
+    // internal retry attempts; eliminating that would require
+    // reworking put_pack's signature.
     let pack_wasm = Arc::new(pack_wasm);
 
     // Phase 1: PUT every chunk in parallel.
-    let mut completed: u32 = 0;
+    let mut puts_completed: u32 = 0;
     let mut put_stream = futures::stream::iter(chunks.into_iter().enumerate())
         .map(|(i, chunk)| {
             let conn = conns[i % conns.len()].clone();
@@ -184,13 +218,17 @@ where
         .buffer_unordered(actual_parallelism);
     while let Some(result) = put_stream.next().await {
         result?;
-        completed += 1;
-        on_step(PublishPhase::PutChunk, completed, n);
+        puts_completed += 1;
+        on_step(PublishPhase::PutChunk, puts_completed, n);
     }
-    drop(put_stream);
 
     // Phase 2: re-GET every chunk in parallel and verify BLAKE3.
-    let mut completed: u32 = 0;
+    // (The BLAKE3 check inside `wsclient::get_pack` already enforces
+    // content-addressing, so the explicit `got_hash != expected_hash`
+    // check below is belt-and-braces; we keep it because the
+    // post-publish verification phase is the one place where a
+    // host-level bug should not silently slip through.)
+    let mut verifies_completed: u32 = 0;
     let mut verify_stream =
         futures::stream::iter(manifest.chunk_hashes.iter().copied().enumerate())
             .map(|(i, expected_hash)| {
@@ -216,10 +254,9 @@ where
             .buffer_unordered(actual_parallelism);
     while let Some(result) = verify_stream.next().await {
         result?;
-        completed += 1;
-        on_step(PublishPhase::VerifyChunk, completed, n);
+        verifies_completed += 1;
+        on_step(PublishPhase::VerifyChunk, verifies_completed, n);
     }
-    drop(verify_stream);
 
     // Phase 3: PUT the manifest as a pack-contract (single connection).
     on_step(PublishPhase::PutManifest, 1, 1);
@@ -311,7 +348,7 @@ pub async fn fetch_chunked_pack_with_progress<F>(
     expected_chunk_count: u32,
     parallelism: usize,
     timeout_per_op: Duration,
-    mut on_chunk: F,
+    on_chunk: F,
 ) -> Result<Vec<u8>>
 where
     F: FnMut(u32, u32),
@@ -321,11 +358,17 @@ where
     }
 
     // Phase 1: open the connection pool, GET the manifest on conn 0.
-    // Cap pool size at the chunk count once we know it. To avoid
-    // reopening the pool, we open `parallelism` connections up front
-    // and just use a subset if the manifest turns out to be smaller.
-    let actual_parallelism = parallelism.min(expected_chunk_count.max(1) as usize);
-    let conns = open_pool(ws_url, actual_parallelism).await?;
+    // We open up to `parallelism` connections, capped at the expected
+    // chunk count; `open_pool` may also return fewer if the node
+    // refuses extras (graceful degradation). The actual pool size is
+    // then used for `buffer_unordered` so chunk dispatch never
+    // exceeds connection availability.
+    let conns = open_pool(
+        ws_url,
+        parallelism.min(expected_chunk_count.max(1) as usize),
+    )
+    .await?;
+    let actual_parallelism = conns.len();
 
     let manifest_bytes = {
         let mut conn = conns[0].lock().await;
@@ -353,15 +396,16 @@ where
         );
     }
 
-    // Phase 4: parallel chunk GETs. Reassemble in manifest order.
+    // Phase 4: parallel chunk GETs. Reassemble in manifest order via
+    // `collect_chunks_into_slots`, which is split out so the slot-by-
+    // index reassembly is unit-testable without spinning up real WS
+    // connections.
     let n = manifest.chunk_count;
-    let mut received: Vec<Option<Vec<u8>>> = vec![None; n as usize];
     let chunk_lens: Vec<u64> = (0..n).map(|i| manifest.chunk_len(i)).collect();
     // Share the WASM blob across chunk tasks via Arc so each task only
     // bumps a refcount instead of deep-cloning the WASM bytes.
     let pack_wasm: Arc<Vec<u8>> = Arc::new(pack_wasm.to_vec());
-    let mut completed: u32 = 0;
-    let mut get_stream = futures::stream::iter(manifest.chunk_hashes.iter().copied().enumerate())
+    let get_stream = futures::stream::iter(manifest.chunk_hashes.iter().copied().enumerate())
         .map(|(i, expected_hash)| {
             let conn = conns[i % conns.len()].clone();
             let pack_wasm = pack_wasm.clone();
@@ -383,15 +427,36 @@ where
             }
         })
         .buffer_unordered(actual_parallelism);
-    while let Some(result) = get_stream.next().await {
+    let received = collect_chunks_into_slots(get_stream, n, on_chunk).await?;
+    assemble_chunks(received, manifest.total_size)
+}
+
+/// Drain a stream of `(chunk_index, chunk_bytes)` results into a
+/// `Vec<Option<Vec<u8>>>` indexed by manifest position. Fires
+/// `on_chunk(completed_count, total)` on each successful completion.
+/// This is the consumer half of the parallel fetch path; pulling it
+/// out lets us unit-test the "completion order does not affect slot
+/// placement" invariant without a real `WebApi`.
+async fn collect_chunks_into_slots<S, F>(
+    stream: S,
+    n: u32,
+    mut on_chunk: F,
+) -> Result<Vec<Option<Vec<u8>>>>
+where
+    S: futures::Stream<Item = Result<(usize, Vec<u8>)>>,
+    F: FnMut(u32, u32),
+{
+    use futures::pin_mut;
+    pin_mut!(stream);
+    let mut received: Vec<Option<Vec<u8>>> = vec![None; n as usize];
+    let mut completed: u32 = 0;
+    while let Some(result) = stream.next().await {
         let (i, chunk) = result?;
         received[i] = Some(chunk);
         completed += 1;
         on_chunk(completed, n);
     }
-    drop(get_stream);
-
-    assemble_chunks(received, manifest.total_size)
+    Ok(received)
 }
 
 /// Concatenate per-chunk byte vectors in manifest order. Errors if any
@@ -414,14 +479,33 @@ fn assemble_chunks(received: Vec<Option<Vec<u8>>>, expected_total_size: u64) -> 
     Ok(assembled)
 }
 
-/// Open `n` parallel WebSocket connections to the Freenet node. All
-/// connections are wrapped in `Arc<Mutex<...>>` so chunk futures can
-/// take exclusive access for the duration of one PUT or GET.
+/// Open up to `n` parallel WebSocket connections to the Freenet
+/// node. **Degrades gracefully**: if the node refuses additional
+/// connections (e.g. it caps the per-client limit) we proceed with
+/// however many we did get, so a parallelism setting that the host
+/// can't honor produces a slower run rather than an outright
+/// failure. We only error if we cannot open even one connection,
+/// since the pre-parallel implementation managed with one.
+///
+/// All connections are wrapped in `Arc<Mutex<...>>` so chunk futures
+/// can take exclusive access for the duration of one PUT or GET.
 async fn open_pool(ws_url: &str, n: usize) -> Result<Vec<Arc<Mutex<WebApi>>>> {
-    let conns = futures::future::try_join_all((0..n).map(|_| wsclient::connect(ws_url)))
-        .await
-        .context("open parallel WS connections")?;
-    Ok(conns.into_iter().map(|c| Arc::new(Mutex::new(c))).collect())
+    let mut pool = Vec::with_capacity(n);
+    for _ in 0..n {
+        match wsclient::connect(ws_url).await {
+            Ok(conn) => pool.push(Arc::new(Mutex::new(conn))),
+            Err(e) if !pool.is_empty() => {
+                tracing::warn!(
+                    "opened {}/{} parallel WS connections; falling back: {e:#}",
+                    pool.len(),
+                    n,
+                );
+                break;
+            }
+            Err(e) => return Err(e).context("open at least one WS connection"),
+        }
+    }
+    Ok(pool)
 }
 
 fn hex_lower(b: &[u8]) -> String {
@@ -438,34 +522,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn assemble_chunks_concatenates_in_order() {
-        // Reassembly is the load-bearing piece for parallel fetch:
-        // chunks complete out of order but must be glued in manifest
-        // order. Use the same input twice in different "completion"
-        // orders and confirm the concatenation is identical.
+    fn assemble_chunks_concatenates_in_slot_order() {
         let in_order: Vec<Option<Vec<u8>>> = vec![
             Some(vec![1, 2, 3]),
             Some(vec![4, 5]),
             Some(vec![6, 7, 8, 9]),
         ];
-        let total: u64 = 9;
-        let expected = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
-        assert_eq!(assemble_chunks(in_order, total).unwrap(), expected);
-
-        // Same chunks, different "completion order" produces the same
-        // assembled bytes because the slot index drives ordering.
-        let mut shuffled: Vec<Option<Vec<u8>>> = vec![None, None, None];
-        shuffled[2] = Some(vec![6, 7, 8, 9]); // completed third chunk first
-        shuffled[0] = Some(vec![1, 2, 3]); // then first
-        shuffled[1] = Some(vec![4, 5]); // then middle
-        assert_eq!(assemble_chunks(shuffled, total).unwrap(), expected);
+        assert_eq!(
+            assemble_chunks(in_order, 9).unwrap(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+        );
     }
 
     #[test]
     fn assemble_chunks_errors_on_missing_slot() {
         let received: Vec<Option<Vec<u8>>> = vec![Some(vec![1, 2]), None, Some(vec![3, 4])];
         let err = assemble_chunks(received, 4).unwrap_err();
-        assert!(err.to_string().contains("chunk 1 missing"), "got: {err}",);
+        assert!(err.to_string().contains("chunk 1 missing"), "got: {err}");
     }
 
     #[test]
@@ -479,32 +552,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn collect_chunks_lands_in_correct_slots_regardless_of_completion_order() {
+        // Drive the consumer with chunks finishing in a deliberately
+        // wrong order. Slot 0 must end up holding chunk-index-0's
+        // bytes regardless of when it arrived.
+        let items: Vec<Result<(usize, Vec<u8>)>> = vec![
+            Ok((2, vec![6, 7, 8, 9])), // chunk index 2 arrives first
+            Ok((0, vec![1, 2, 3])),    // chunk index 0 arrives second
+            Ok((1, vec![4, 5])),       // chunk index 1 arrives last
+        ];
+        let stream = futures::stream::iter(items);
+        let mut progress: Vec<(u32, u32)> = Vec::new();
+        let received = collect_chunks_into_slots(stream, 3, |done, total| {
+            progress.push((done, total));
+        })
+        .await
+        .unwrap();
+        assert_eq!(received[0], Some(vec![1, 2, 3]));
+        assert_eq!(received[1], Some(vec![4, 5]));
+        assert_eq!(received[2], Some(vec![6, 7, 8, 9]));
+        // Progress fires in completion order with monotonic count.
+        assert_eq!(progress, vec![(1, 3), (2, 3), (3, 3)]);
+    }
+
+    #[tokio::test]
+    async fn collect_chunks_propagates_errors_and_does_not_advance_progress() {
+        let items: Vec<Result<(usize, Vec<u8>)>> = vec![
+            Ok((0, vec![1])),
+            Err(anyhow::anyhow!("simulated chunk failure")),
+            Ok((2, vec![3])),
+        ];
+        let stream = futures::stream::iter(items);
+        let mut progress: Vec<(u32, u32)> = Vec::new();
+        let result = collect_chunks_into_slots(stream, 3, |done, total| {
+            progress.push((done, total));
+        })
+        .await;
+        assert!(result.is_err());
+        // Progress fired only for the successful first chunk; the
+        // error short-circuits before the callback fires for the
+        // second item.
+        assert_eq!(progress, vec![(1, 3)]);
+    }
+
     #[test]
-    fn parallelism_from_env_handles_unset_zero_and_invalid() {
-        // SAFETY: env mutation in tests. This is the only test that
-        // touches FREENET_GIT_PARALLEL_OPS so there is no race with
-        // sibling tests. cargo test runs each test in its own thread
-        // but the same process, so we restore the var at the end.
-        let prev = std::env::var("FREENET_GIT_PARALLEL_OPS").ok();
-
-        std::env::remove_var("FREENET_GIT_PARALLEL_OPS");
-        assert_eq!(parallelism_from_env(), DEFAULT_PARALLEL_OPS);
-
-        std::env::set_var("FREENET_GIT_PARALLEL_OPS", "1");
-        assert_eq!(parallelism_from_env(), 1);
-
-        std::env::set_var("FREENET_GIT_PARALLEL_OPS", "16");
-        assert_eq!(parallelism_from_env(), 16);
-
-        std::env::set_var("FREENET_GIT_PARALLEL_OPS", "0");
-        assert_eq!(parallelism_from_env(), DEFAULT_PARALLEL_OPS);
-
-        std::env::set_var("FREENET_GIT_PARALLEL_OPS", "not-a-number");
-        assert_eq!(parallelism_from_env(), DEFAULT_PARALLEL_OPS);
-
-        match prev {
-            Some(v) => std::env::set_var("FREENET_GIT_PARALLEL_OPS", v),
-            None => std::env::remove_var("FREENET_GIT_PARALLEL_OPS"),
-        }
+    fn parse_parallelism_handles_all_inputs() {
+        assert_eq!(parse_parallelism(None), DEFAULT_PARALLEL_OPS);
+        assert_eq!(parse_parallelism(Some("1")), 1);
+        assert_eq!(parse_parallelism(Some("16")), 16);
+        assert_eq!(parse_parallelism(Some("0")), DEFAULT_PARALLEL_OPS);
+        assert_eq!(parse_parallelism(Some("")), DEFAULT_PARALLEL_OPS);
+        assert_eq!(
+            parse_parallelism(Some("not-a-number")),
+            DEFAULT_PARALLEL_OPS
+        );
+        assert_eq!(parse_parallelism(Some("-1")), DEFAULT_PARALLEL_OPS);
     }
 }
