@@ -12,10 +12,10 @@ Hosted on Freenet and clonable today:
 
 ```sh
 # freenet-core HEAD source snapshot (no full history)
-git clone freenet::AaRxPZVdWrPh/freenet-core
+git clone freenet::3GEERif5ihbf/freenet-core
 
 # freenet-stdlib full git history (177 commits)
-git clone freenet::2pyvKxrozxgT/freenet-stdlib
+git clone freenet::96rknpy1GYhZ/freenet-stdlib
 ```
 
 Requires `cargo install freenet-git` and a running local Freenet node.
@@ -65,7 +65,7 @@ WebSocket API endpoint defaults to
 ### 3. Clone a live repo
 
 ```sh
-git clone freenet::2pyvKxrozxgT/freenet-stdlib
+git clone freenet::96rknpy1GYhZ/freenet-stdlib
 ```
 
 No identity, no setup. Just `git clone` against a real
@@ -234,9 +234,15 @@ location and bumps it back to the top of their LRU cache.
 
 For repos you publish and want to keep reachable, run rescue as a
 cron job (e.g. once a day or a few times a week) from a node that
-holds the data. A future release will add `freenet-git rescue --from
-<git-dir>` so any clone-holder can rescue from their working tree
-even if the local node's cache has also forgotten.
+holds the data. The demo URLs above are kept alive by the
+`rescue-demos` GitHub Actions workflow in this repo
+(`.github/workflows/rescue-demos.yml`); content freshness for the
+`freenet-core` and `freenet-stdlib` mirrors is driven from those
+upstream repos' workflows that call
+`freenet/freenet-git/.github/workflows/mirror-repo.yml`. A future
+release will add `freenet-git rescue --from <git-dir>` so any
+clone-holder can rescue from their working tree even if the local
+node's cache has also forgotten.
 
 ## How URLs work
 

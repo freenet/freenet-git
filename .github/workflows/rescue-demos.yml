@@ -1,0 +1,39 @@
+name: Rescue demo repos on Freenet
+
+# Periodically re-PUTs the bundles and chunks behind the demo repos so
+# they don't fall out of peers' LRU caches. Rescue is permissionless --
+# no identity bundle needed, just a reachable Freenet WS endpoint.
+#
+# Required secret: FREENET_GIT_WS_URL (= RIVER_GATEWAY_URL in this org).
+
+on:
+  schedule:
+    # Twice a day, offset from the hour to dodge the cron stampede.
+    - cron: "17 6,18 * * *"
+  workflow_dispatch:
+
+jobs:
+  rescue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        repo:
+          - "freenet:3GEERif5ihbf/freenet-core"
+          - "freenet:96rknpy1GYhZ/freenet-stdlib"
+          - "freenet:99TmCayXn6Tm/freenet-git"
+    steps:
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Install freenet-git from crates.io
+        run: cargo install freenet-git --locked
+
+      - name: Rescue
+        env:
+          WS_URL: ${{ secrets.FREENET_GIT_WS_URL }}
+        run: |
+          freenet-git rescue "${{ matrix.repo }}" --ws-url "$WS_URL"

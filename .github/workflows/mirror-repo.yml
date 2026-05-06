@@ -1,0 +1,131 @@
+name: Mirror repo to Freenet (reusable)
+
+# Reusable workflow that mirrors the caller's repository content into a
+# Freenet-hosted repo. Called from `freenet-core` and `freenet-stdlib`
+# via `uses: freenet/freenet-git/.github/workflows/mirror-repo.yml@<ref>`.
+#
+# Prerequisites in the *caller* repo:
+#   secrets.FREENET_GIT_IDENTITY_BUNDLE_BASE64
+#       base64 of an unencrypted identity bundle that owns the prefix in
+#       `inputs.freenet_url`. Generate with
+#       `freenet-git init-identity --no-passphrase` and
+#       `freenet-git create --name <name> ...` to register the prefix.
+#   secrets.FREENET_GIT_WS_URL
+#       WebSocket URL of a reachable Freenet node. We reuse
+#       `RIVER_GATEWAY_URL` in this org -- both point at the same nova
+#       gateway proxy.
+
+on:
+  workflow_call:
+    inputs:
+      freenet_repo:
+        description: "Target Freenet repo as `<prefix>/<label>`, e.g. `3GEERif5ihbf/freenet-core`"
+        required: true
+        type: string
+      mode:
+        description: "snapshot (orphan commit of HEAD) or history (push main as-is)"
+        required: true
+        type: string
+      branch:
+        description: "Source branch to mirror (default: main)"
+        required: false
+        type: string
+        default: main
+      freenet_git_version:
+        description: "Pin a freenet-git crates.io version, or 'latest'"
+        required: false
+        type: string
+        default: latest
+    secrets:
+      FREENET_GIT_IDENTITY_BUNDLE_BASE64:
+        required: true
+      FREENET_GIT_WS_URL:
+        required: true
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Validate mode
+        run: |
+          if [ "${{ inputs.mode }}" != "snapshot" ] && [ "${{ inputs.mode }}" != "history" ]; then
+            echo "::error::mode must be 'snapshot' or 'history', got '${{ inputs.mode }}'"
+            exit 1
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Install freenet-git from crates.io
+        run: |
+          if [ "${{ inputs.freenet_git_version }}" = "latest" ]; then
+            cargo install freenet-git --locked
+          else
+            cargo install freenet-git --version "${{ inputs.freenet_git_version }}" --locked
+          fi
+          freenet-git --version
+
+      - name: Write identity bundle
+        env:
+          BUNDLE_B64: ${{ secrets.FREENET_GIT_IDENTITY_BUNDLE_BASE64 }}
+        run: |
+          mkdir -p ~/.config/freenet
+          umask 077
+          printf '%s' "$BUNDLE_B64" | base64 -d > ~/.config/freenet/git-identity.bundle
+          chmod 600 ~/.config/freenet/git-identity.bundle
+          freenet-git whoami | sed -n '1,3p'   # sanity check, no secrets in output
+
+      - name: Check out source repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.branch }}
+
+      - name: Build push commit
+        id: build
+        run: |
+          set -euo pipefail
+          SRC_SHA=$(git rev-parse HEAD)
+          echo "src_sha=$SRC_SHA" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ inputs.mode }}" = "history" ]; then
+            echo "history mode: pushing $SRC_SHA on ${{ inputs.branch }} as-is"
+            cp -a . /tmp/push-tree
+          else
+            # snapshot: build a fresh non-shallow repo containing only the
+            # tree at HEAD as a single orphan commit. freenet-git rejects
+            # shallow pushes, so we rebuild instead of using --orphan on
+            # the existing repo.
+            mkdir /tmp/push-tree
+            tar -cf - --exclude=.git . | tar -xf - -C /tmp/push-tree
+            cd /tmp/push-tree
+            git init -b ${{ inputs.branch }} --quiet
+            git -c user.name="Freenet Mirror Bot" \
+                -c user.email="freenet-mirror@github.actions" \
+                add .
+            git -c user.name="Freenet Mirror Bot" \
+                -c user.email="freenet-mirror@github.actions" \
+                commit --quiet -m "snapshot of ${{ github.repository }}@${SRC_SHA}"
+            echo "snapshot mode: built orphan commit for $SRC_SHA"
+          fi
+
+      - name: Push to Freenet
+        env:
+          FREENET_GIT_WS_URL: ${{ secrets.FREENET_GIT_WS_URL }}
+        run: |
+          set -euo pipefail
+          cd /tmp/push-tree
+          # The double-colon form is required by git remote-helpers to
+          # disambiguate from SCP-style URLs.
+          git remote add freenet "freenet::${{ inputs.freenet_repo }}"
+          # snapshot mode force-pushes: each invocation builds a fresh
+          # orphan commit with no shared history, so the previous tip is
+          # never an ancestor of the new tip.
+          if [ "${{ inputs.mode }}" = "snapshot" ]; then
+            git push freenet "+${{ inputs.branch }}:${{ inputs.branch }}"
+          else
+            git push freenet "${{ inputs.branch }}:${{ inputs.branch }}"
+          fi
