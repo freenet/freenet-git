@@ -180,6 +180,16 @@ jobs:
             # commit in a fresh non-shallow repo. freenet-git rejects
             # pushes from shallow clones, hence the rebuild rather than
             # `git checkout --orphan` on the existing repo.
+            #
+            # The orphan commit's author/committer dates come from the
+            # source commit's committer date so the snapshot SHA is a
+            # pure function of the input. Without this, `git commit`
+            # picks up wall-clock time and the daily safety-net cron
+            # produces a fresh contract write every day even when the
+            # source tree hasn't moved.
+            SRC_DATE=$(git log -1 --format=%cI HEAD)
+            export GIT_AUTHOR_DATE="$SRC_DATE"
+            export GIT_COMMITTER_DATE="$SRC_DATE"
             git archive HEAD | tar -xf - -C /tmp/push-tree
             cd /tmp/push-tree
             git init -b "$BRANCH" --quiet
@@ -189,7 +199,8 @@ jobs:
             git -c user.name="Freenet Mirror Bot" \
                 -c user.email="freenet-mirror@github.actions" \
                 commit --quiet -m "snapshot of ${REPO_FULL}@${SRC_SHA}"
-            echo "snapshot mode: built orphan commit for $SRC_SHA"
+            SNAP_SHA=$(git rev-parse HEAD)
+            echo "snapshot mode: built orphan commit $SNAP_SHA for $SRC_SHA at $SRC_DATE"
           fi
 
       - name: Push to Freenet
