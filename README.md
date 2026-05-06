@@ -114,20 +114,12 @@ freenet-git init-identity --no-passphrase \
 git push freenet main      # no env var needed
 ```
 
-The bundle file is then recoverable by anyone who can read it, so
-this is only safe when the file itself already lives in an
-authenticated secret store: GitHub Actions secrets, an OS keychain,
-an encrypted volume. Adding a passphrase on top of those is
-redundant — a compromise that exposes the file also exposes any
-passphrase next to it. This is the recommended path for CI
-workflows that mirror repositories into Freenet.
-
-Caveat: the on-disk envelope does not distinguish encrypted from
-unencrypted bundles, so an attacker with disk-write access to your
-bundle can swap an encrypted bundle for an attacker-owned
-unencrypted one. The helper and `freenet-git whoami` print a
-warning when an unencrypted bundle is opened unexpectedly; treat
-that as a reason to investigate.
+The bundle file then holds the signing authority directly — no
+encryption layer. Use this when the file already lives in an
+authenticated store (CI secrets, an OS keychain, an encrypted
+volume); putting a passphrase on top there is redundant. This is
+the recommended path for CI workflows that mirror repositories
+into Freenet.
 
 ## Sending changes to a maintainer
 

@@ -63,11 +63,7 @@ fn chunk_size_from_env() -> u32 {
 ///
 /// Resolution order matches the CLI's `open_bundle_remembering_passphrase`:
 /// 1. If `FREENET_GIT_PASSPHRASE` is set and decrypts, use it.
-/// 2. Otherwise try the empty passphrase (unencrypted bundle path). When
-///    this succeeds for a user who did not opt in via
-///    `FREENET_GIT_PASSPHRASE=""`, emit a stderr warning so a silent
-///    identity swap on a tampered bundle is visible — git lets the
-///    helper's stderr through to the user's terminal.
+/// 2. Otherwise try the empty passphrase (unencrypted bundle path).
 /// 3. Otherwise surface a directed error.
 fn read_identity_for_helper(path: &std::path::Path) -> Result<DecryptedBundle> {
     let bytes = std::fs::read(path)
@@ -81,14 +77,6 @@ fn read_identity_for_helper(path: &std::path::Path) -> Result<DecryptedBundle> {
     }
 
     if let Ok(b) = identity::open(&bytes, "") {
-        if env_pw.as_deref() != Some("") {
-            eprintln!(
-                "warning: opened unencrypted identity bundle at {} \
-                 -- if you expected an encrypted bundle, the file may \
-                 have been tampered with",
-                path.display()
-            );
-        }
         return Ok(b);
     }
 

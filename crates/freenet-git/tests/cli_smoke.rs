@@ -172,13 +172,6 @@ fn no_passphrase_init_and_whoami_with_env_unset() {
         stdout.contains("Encryption: none"),
         "whoami should report unencrypted status; got: {stdout}"
     );
-    // The opener prints a warning when a silent-empty fallback opens a
-    // bundle and the user did NOT opt in via FREENET_GIT_PASSPHRASE="".
-    // Here the env var is unset, so the warning fires.
-    assert!(
-        stderr.contains("opened unencrypted identity bundle"),
-        "expected silent-fallback warning; got stderr: {stderr}"
-    );
 }
 
 #[test]

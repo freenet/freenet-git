@@ -6,43 +6,27 @@
 //! under "Unencrypted bundles" below skips the encryption layer. Lives by
 //! default at `~/.config/freenet/git-identity.bundle`.
 //!
-//! # Threat model
+//! # Encryption is opt-in
 //!
-//! For passphrase-protected bundles, identical to SSH key material:
-//!
-//! - A local attacker with **disk access AND the passphrase** can sign as
-//!   you. Phase 1 does not protect against that case.
-//! - A local attacker with **disk access only** sees ciphertext. Brute
-//!   forcing the passphrase requires running scrypt at the pinned
-//!   parameters per guess; with a strong passphrase that is infeasible.
-//! - A **remote attacker** never sees the secret — it is only on the user's
-//!   disk. The on-host helper holds the decrypted secret in memory only
-//!   for the duration of one CLI invocation.
+//! For passphrase-protected bundles, the threat model is identical to
+//! SSH key material: a local attacker with disk access AND the
+//! passphrase can sign as you; with disk access only they see
+//! ciphertext and have to brute-force scrypt; a remote attacker never
+//! sees the secret.
 //!
 //! For unencrypted bundles, the on-disk file alone holds the signing
-//! authority: anyone who can read the file can sign as you, and anyone
-//! who can write the file can swap your identity. Mode is therefore only
-//! safe when the file itself is already protected by an authenticated
-//! store (CI secrets, an OS keychain, an encrypted volume). See below.
-//!
-//! Note that an attacker with disk-write access to an encrypted bundle
-//! can replace it with an unencrypted bundle carrying their own keypair;
-//! the on-disk envelope does not distinguish the two modes, so a
-//! subsequent open succeeds without any passphrase prompt. CLI callers
-//! mitigate by emitting a stderr notice when the empty-passphrase
-//! fallback path opens a bundle and by surfacing the bundle's encryption
-//! mode in `freenet-git whoami`. A future format version will bind the
-//! mode into the AEAD associated data so the swap fails noisily.
+//! authority. That's fine when the file itself is already protected
+//! (CI secrets, an OS keychain, an encrypted volume) — adding a
+//! passphrase on top under those conditions is redundant. See below.
 //!
 //! # Unencrypted bundles
 //!
 //! Calling [`seal`] (or [`write_bundle`]) with an empty passphrase
-//! produces a bundle whose contents are recoverable by anyone holding the
-//! file: the KDF step is skipped and a fixed all-zero key is used in its
-//! place. Symmetrically, [`open`] (and [`read_bundle`]) with an empty
-//! passphrase succeeds for unencrypted bundles and fails the AEAD tag
-//! check for encrypted ones — callers can use this to detect the mode of
-//! a bundle without prompting.
+//! produces a bundle whose contents are recoverable by anyone holding
+//! the file: the KDF step is skipped and a fixed all-zero key is used
+//! in its place. Symmetrically, [`open`] (and [`read_bundle`]) with an
+//! empty passphrase succeeds for unencrypted bundles and fails the AEAD
+//! tag check for encrypted ones.
 //!
 //! The on-disk envelope still carries fresh `KdfParams` (salt, work
 //! factors) for unencrypted bundles, even though they are unused in the
@@ -51,11 +35,6 @@
 //! decryption, since they have no empty-passphrase shortcut, but the
 //! parse succeeds). Future "optimizations" that elide those fields
 //! would be a wire-format break.
-//!
-//! Use this mode only when the bundle file already lives in an
-//! authenticated secret store (GitHub Actions secrets, an OS keychain, an
-//! encrypted volume) — adding a passphrase on top is then redundant. For
-//! anything sitting in a user's home directory, keep the passphrase.
 //!
 //! # Wire format (v1)
 //!
