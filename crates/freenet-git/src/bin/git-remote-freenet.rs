@@ -29,7 +29,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use freenet_git_cli::ids::pack_contract_id;
 use freenet_git_cli::url;
 use freenet_git_cli::wsclient::{self, DEFAULT_WS_URL};
-use freenet_git_identity::{default_bundle_path, read_bundle};
+use freenet_git_identity::{self as identity, default_bundle_path, DecryptedBundle};
 use freenet_git_types::signing::{sign_bundle_record, sign_ref_entry};
 use freenet_git_types::{update_state as ts_update_state, CommitHash, ObjectBundle, RepoState};
 use freenet_stdlib::prelude::ContractInstanceId;
@@ -56,6 +56,29 @@ fn chunk_size_from_env() -> u32 {
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(freenet_git_types::chunked::DEFAULT_CHUNK_SIZE)
+}
+
+/// Decrypt the identity bundle from inside the helper, where prompting
+/// is impossible (git owns stdin/stdout). Honors `FREENET_GIT_PASSPHRASE`
+/// for encrypted bundles and silently opens unencrypted ones (created
+/// with `freenet-git init-identity --no-passphrase`).
+fn read_identity_for_helper(path: &std::path::Path) -> Result<DecryptedBundle> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("read identity bundle at {}", path.display()))?;
+
+    if let Ok(pw) = std::env::var("FREENET_GIT_PASSPHRASE") {
+        return identity::open(&bytes, &pw).map_err(Into::into);
+    }
+
+    if let Ok(b) = identity::open(&bytes, "") {
+        return Ok(b);
+    }
+
+    Err(anyhow!(
+        "FREENET_GIT_PASSPHRASE must be set to push to an encrypted bundle \
+         (the helper cannot prompt because git owns stdin/stdout). For an \
+         unencrypted bundle, leave the variable unset."
+    ))
 }
 
 fn main() -> ExitCode {
@@ -486,16 +509,11 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
     let repo_wasm = load_repo_wasm(env)?;
     let pack_wasm = load_pack_wasm(env)?;
 
-    // Decrypt identity once (asks for the passphrase via FREENET_GIT_PASSPHRASE
-    // or, in interactive use, via a separate `freenet-git` invocation; we
-    // don't prompt from inside the helper because git owns stdin/stdout).
-    let pw = std::env::var("FREENET_GIT_PASSPHRASE").map_err(|_| {
-        anyhow!(
-            "FREENET_GIT_PASSPHRASE must be set when using git push freenet:... — \
-             the helper cannot prompt because git owns stdin/stdout"
-        )
-    })?;
-    let bundle = read_bundle(&env.identity_path, &pw)
+    // Decrypt identity once. The helper can't prompt because git owns
+    // stdin/stdout, so for encrypted bundles the user must set
+    // FREENET_GIT_PASSPHRASE up front. Unencrypted bundles (created with
+    // `freenet-git init-identity --no-passphrase`) open silently here.
+    let bundle = read_identity_for_helper(&env.identity_path)
         .with_context(|| format!("decrypt identity bundle at {}", env.identity_path.display()))?;
 
     // Find the per-repo signing key in the bundle by matching the URL

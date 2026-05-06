@@ -18,6 +18,19 @@
 //!   disk. The on-host helper holds the decrypted secret in memory only
 //!   for the duration of one CLI invocation.
 //!
+//! # Unencrypted bundles
+//!
+//! Calling [`seal`] (or [`write_bundle`]) with an empty passphrase produces
+//! a bundle whose contents are recoverable by anyone holding the file: the
+//! KDF step is skipped and a fixed all-zero key is used in its place. The
+//! envelope format is unchanged, so existing readers and writers continue
+//! to work with no compatibility shim.
+//!
+//! Use this mode only when the bundle file already lives in an
+//! authenticated secret store (GitHub Actions secrets, an OS keychain, an
+//! encrypted volume) — adding a passphrase on top is then redundant. For
+//! anything sitting in a user's home directory, keep the passphrase.
+//!
 //! # Wire format (v1)
 //!
 //! ```text
@@ -156,6 +169,15 @@ impl KdfParams {
     }
 
     fn derive_key(&self, passphrase: &str) -> Result<[u8; 32], BundleError> {
+        // Empty passphrase is a sentinel for "unencrypted at rest": the
+        // key is publicly derivable (all zeros) so anyone with the file
+        // can open it. Used when the bundle file itself lives in an
+        // authenticated secret store (GitHub Actions secrets, OS
+        // keychain) and the on-disk encryption layer is redundant.
+        // Skips scrypt to keep CLI invocations snappy in CI.
+        if passphrase.is_empty() {
+            return Ok([0u8; 32]);
+        }
         self.enforce_minimum()?;
         let params = scrypt::Params::new(self.log_n, self.r, self.p, 32)
             .map_err(|e| BundleError::Crypto(format!("scrypt params: {e}")))?;
@@ -542,5 +564,34 @@ mod tests {
         // Decoded bytes must equal the public key.
         let decoded = bs58::decode(&s["freenet:id:".len()..]).into_vec().unwrap();
         assert_eq!(decoded, bundle.public_key);
+    }
+
+    #[test]
+    fn empty_passphrase_round_trip() {
+        let bundle = DecryptedBundle::new("None".into(), "n@e.com".into());
+        let sealed = seal(&bundle, "").unwrap();
+        let opened = open(&sealed, "").unwrap();
+        assert_eq!(opened.public_key, bundle.public_key);
+        assert_eq!(opened.name, "None");
+    }
+
+    #[test]
+    fn empty_passphrase_does_not_open_encrypted_bundle() {
+        let bundle = DecryptedBundle::new("X".into(), "x@e.com".into());
+        let sealed = seal(&bundle, "real-passphrase").unwrap();
+        match open(&sealed, "") {
+            Err(BundleError::Decrypt) => {}
+            other => panic!("expected Decrypt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_passphrase_does_not_open_unencrypted_bundle() {
+        let bundle = DecryptedBundle::new("X".into(), "x@e.com".into());
+        let sealed = seal(&bundle, "").unwrap();
+        match open(&sealed, "real-passphrase") {
+            Err(BundleError::Decrypt) => {}
+            other => panic!("expected Decrypt, got {other:?}"),
+        }
     }
 }

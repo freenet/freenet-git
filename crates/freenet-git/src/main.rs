@@ -25,7 +25,7 @@ use freenet_git_cli::state_init::initial_repo_state;
 use freenet_git_cli::url;
 use freenet_git_cli::wsclient::{self, DEFAULT_WS_URL};
 use freenet_git_identity::{
-    default_bundle_path, read_bundle, write_bundle, DecryptedBundle, RepoRegistryEntry,
+    self as identity, default_bundle_path, write_bundle, DecryptedBundle, RepoRegistryEntry,
 };
 use freenet_git_types::{limits, pubkey_prefix, RepoParams};
 use rand::rngs::OsRng;
@@ -57,6 +57,13 @@ enum Cmd {
         /// Email to embed in the bundle.
         #[arg(long)]
         email: String,
+        /// Skip passphrase encryption. The bundle file becomes recoverable
+        /// by anyone who can read it. Use only when the file itself lives
+        /// in an authenticated secret store (CI secrets, OS keychain,
+        /// encrypted volume) — the on-disk encryption layer is then
+        /// redundant.
+        #[arg(long)]
+        no_passphrase: bool,
     },
     /// Print the identity stored in the bundle.
     Whoami,
@@ -65,12 +72,20 @@ enum Cmd {
     ExportIdentity {
         /// Path to write the exported bundle.
         out: PathBuf,
+        /// Write the exported bundle without passphrase encryption. See
+        /// the equivalent flag on `init-identity` for when this is safe.
+        #[arg(long)]
+        no_passphrase: bool,
     },
     /// Replace the local bundle with the one at `from` (decrypted with the
     /// supplied passphrase, re-encrypted in place).
     ImportIdentity {
         /// Path to read the source bundle.
         from: PathBuf,
+        /// Write the new local bundle without passphrase encryption. See
+        /// the equivalent flag on `init-identity` for when this is safe.
+        #[arg(long)]
+        no_passphrase: bool,
     },
     /// Derive the contract URL for a brand-new repo, build its initial
     /// signed state, and publish it to a local Freenet node.
@@ -149,10 +164,19 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<()> {
     let bundle_path = cli.identity_path.unwrap_or_else(default_bundle_path);
     match cli.cmd {
-        Cmd::InitIdentity { name, email } => init_identity(&bundle_path, name, email),
+        Cmd::InitIdentity {
+            name,
+            email,
+            no_passphrase,
+        } => init_identity(&bundle_path, name, email, no_passphrase),
         Cmd::Whoami => whoami(&bundle_path),
-        Cmd::ExportIdentity { out } => export_identity(&bundle_path, &out),
-        Cmd::ImportIdentity { from } => import_identity(&bundle_path, &from),
+        Cmd::ExportIdentity { out, no_passphrase } => {
+            export_identity(&bundle_path, &out, no_passphrase)
+        }
+        Cmd::ImportIdentity {
+            from,
+            no_passphrase,
+        } => import_identity(&bundle_path, &from, no_passphrase),
         Cmd::Create {
             name,
             description,
@@ -179,7 +203,12 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn init_identity(path: &std::path::Path, name: String, email: String) -> Result<()> {
+fn init_identity(
+    path: &std::path::Path,
+    name: String,
+    email: String,
+    no_passphrase: bool,
+) -> Result<()> {
     if path.exists() {
         bail!(
             "identity bundle already exists at {} -- refusing to overwrite. \
@@ -188,12 +217,19 @@ fn init_identity(path: &std::path::Path, name: String, email: String) -> Result<
         );
     }
 
-    let pw = prompt_passphrase_with_confirm("Passphrase for new identity")?;
+    let pw = if no_passphrase {
+        String::new()
+    } else {
+        prompt_passphrase_with_confirm("Passphrase for new identity")?
+    };
     let bundle = DecryptedBundle::new(name, email);
     write_bundle(&bundle, &pw, path).with_context(|| format!("write {}", path.display()))?;
     println!("Generated ed25519 keypair.");
     println!("Public key: {}", bundle.id_string());
     println!("Bundle written to: {}", path.display());
+    if no_passphrase {
+        println!("Bundle is unencrypted at rest -- protect the file accordingly.");
+    }
     Ok(())
 }
 
@@ -216,21 +252,35 @@ fn whoami(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn export_identity(path: &std::path::Path, out: &std::path::Path) -> Result<()> {
+fn export_identity(
+    path: &std::path::Path,
+    out: &std::path::Path,
+    no_passphrase: bool,
+) -> Result<()> {
     let bundle = open_bundle_with_prompt(path)?;
-    let pw = prompt_passphrase_with_confirm("Passphrase for exported bundle")?;
+    let pw = if no_passphrase {
+        String::new()
+    } else {
+        prompt_passphrase_with_confirm("Passphrase for exported bundle")?
+    };
     // Use write_bundle to get atomic-rename + 0600 permissions on Unix.
     // Plain `std::fs::write` would leave the bundle world-readable
     // depending on the user's umask.
     write_bundle(&bundle, &pw, out)
         .with_context(|| format!("write exported bundle to {}", out.display()))?;
     println!("Wrote bundle to {}", out.display());
+    if no_passphrase {
+        println!("Exported bundle is unencrypted at rest -- protect the file accordingly.");
+    }
     Ok(())
 }
 
-fn import_identity(local_path: &std::path::Path, from: &std::path::Path) -> Result<()> {
-    let pw_in = prompt_passphrase("Passphrase for source bundle")?;
-    let bundle = read_bundle(from, &pw_in)
+fn import_identity(
+    local_path: &std::path::Path,
+    from: &std::path::Path,
+    no_passphrase: bool,
+) -> Result<()> {
+    let bundle = open_any_bundle(from)
         .with_context(|| format!("read source bundle at {}", from.display()))?;
     if local_path.exists() {
         bail!(
@@ -238,13 +288,20 @@ fn import_identity(local_path: &std::path::Path, from: &std::path::Path) -> Resu
             local_path.display()
         );
     }
-    let pw_out = prompt_passphrase_with_confirm("Passphrase for new local bundle")?;
+    let pw_out = if no_passphrase {
+        String::new()
+    } else {
+        prompt_passphrase_with_confirm("Passphrase for new local bundle")?
+    };
     write_bundle(&bundle, &pw_out, local_path)?;
     println!(
         "Imported identity {} into {}",
         bundle.id_string(),
         local_path.display()
     );
+    if no_passphrase {
+        println!("Local bundle is unencrypted at rest -- protect the file accordingly.");
+    }
     Ok(())
 }
 
@@ -259,7 +316,7 @@ fn create_repo(
     no_publish: bool,
     publish_timeout: Duration,
 ) -> Result<()> {
-    let bundle = open_bundle_with_prompt(bundle_path)?;
+    let (bundle, bundle_passphrase) = open_bundle_remembering_passphrase(bundle_path)?;
 
     let repo_wasm: Vec<u8> = match repo_wasm_path {
         Some(path) => std::fs::read(path)
@@ -320,7 +377,14 @@ fn create_repo(
         println!(
             "  fdev publish --code {repo_wasm_path_str} --parameters {parameters_path} contract --state {state_path}",
         );
-        return register_in_bundle(bundle, bundle_path, &repo_signing, &prefix, name);
+        return register_in_bundle(
+            bundle,
+            &bundle_passphrase,
+            bundle_path,
+            &repo_signing,
+            &prefix,
+            name,
+        );
     }
 
     let ws_url = publish_to.unwrap_or(DEFAULT_WS_URL).to_string();
@@ -346,11 +410,19 @@ fn create_repo(
 
     println!("PUT confirmed by host. Contract key: {}", key.id());
 
-    register_in_bundle(bundle, bundle_path, &repo_signing, &prefix, name)
+    register_in_bundle(
+        bundle,
+        &bundle_passphrase,
+        bundle_path,
+        &repo_signing,
+        &prefix,
+        name,
+    )
 }
 
 fn register_in_bundle(
     bundle: DecryptedBundle,
+    passphrase: &str,
     bundle_path: &std::path::Path,
     repo_signing: &SigningKey,
     prefix: &str,
@@ -363,8 +435,7 @@ fn register_in_bundle(
         prefix: prefix.to_string(),
         display_name: name.to_string(),
     });
-    let pw = prompt_passphrase("Passphrase to update bundle (registry entry)")?;
-    write_bundle(&bundle_with_repo, &pw, bundle_path)?;
+    write_bundle(&bundle_with_repo, passphrase, bundle_path)?;
     println!();
     println!("Registered repo in identity bundle.");
     Ok(())
@@ -598,41 +669,70 @@ async fn rescue_chunked(
 }
 
 fn open_bundle_with_prompt(path: &std::path::Path) -> Result<DecryptedBundle> {
+    Ok(open_bundle_remembering_passphrase(path)?.0)
+}
+
+/// Read a bundle that may or may not be passphrase-encrypted, prompting
+/// only when we actually need a passphrase. Returns the passphrase that
+/// was used so the caller can re-seal the bundle later (e.g. after
+/// updating the repo registry) without re-prompting.
+///
+/// Resolution order:
+/// 1. If `FREENET_GIT_PASSPHRASE` is set (even to empty), use it directly
+///    -- this is the non-interactive path and the caller has already
+///    declared their intent.
+/// 2. Otherwise, try the empty passphrase silently. Unencrypted bundles
+///    open here without prompting.
+/// 3. Fall back to a TTY prompt for an encrypted bundle.
+fn open_bundle_remembering_passphrase(path: &std::path::Path) -> Result<(DecryptedBundle, String)> {
     if !path.exists() {
         bail!(
             "no identity bundle at {} -- run `freenet-git init-identity` first",
             path.display()
         );
     }
-    let pw = prompt_passphrase("Passphrase")?;
-    let bundle =
-        read_bundle(path, &pw).with_context(|| format!("decrypt bundle at {}", path.display()))?;
-    Ok(bundle)
+    let bytes = std::fs::read(path)?;
+
+    if let Ok(pw) = std::env::var("FREENET_GIT_PASSPHRASE") {
+        let bundle = identity::open(&bytes, &pw)
+            .with_context(|| format!("decrypt bundle at {}", path.display()))?;
+        return Ok((bundle, pw));
+    }
+
+    if let Ok(b) = identity::open(&bytes, "") {
+        return Ok((b, String::new()));
+    }
+
+    let pw = rpassword::prompt_password("Passphrase: ")?;
+    if pw.is_empty() {
+        bail!("empty passphrase");
+    }
+    let bundle = identity::open(&bytes, &pw)
+        .with_context(|| format!("decrypt bundle at {}", path.display()))?;
+    Ok((bundle, pw))
 }
 
-/// Read a passphrase. For interactive use, prompts on the controlling
-/// TTY via `rpassword`. For non-interactive use (CI, tests, scripts),
-/// `FREENET_GIT_PASSPHRASE` short-circuits the prompt — required because
-/// rpassword fails outright when no TTY is attached.
-fn prompt_passphrase(prompt: &str) -> Result<String> {
+fn open_any_bundle(path: &std::path::Path) -> Result<DecryptedBundle> {
+    open_bundle_remembering_passphrase(path).map(|(b, _)| b)
+}
+
+/// Prompt for a NEW passphrase (with confirmation) when creating or
+/// re-encrypting a bundle. Honors `FREENET_GIT_PASSPHRASE` for
+/// non-interactive use; an empty value is rejected here because the
+/// `--no-passphrase` flag is the explicit way to opt out of encryption.
+fn prompt_passphrase_with_confirm(prompt: &str) -> Result<String> {
     if let Ok(pw) = std::env::var("FREENET_GIT_PASSPHRASE") {
         if pw.is_empty() {
-            bail!("empty FREENET_GIT_PASSPHRASE");
+            bail!(
+                "FREENET_GIT_PASSPHRASE is empty -- pass --no-passphrase \
+                 to create an unencrypted bundle"
+            );
         }
         return Ok(pw);
     }
     let pw = rpassword::prompt_password(format!("{prompt}: "))?;
     if pw.is_empty() {
-        bail!("empty passphrase");
-    }
-    Ok(pw)
-}
-
-fn prompt_passphrase_with_confirm(prompt: &str) -> Result<String> {
-    // Single env var fills both prompts in non-interactive mode.
-    let pw = prompt_passphrase(prompt)?;
-    if std::env::var("FREENET_GIT_PASSPHRASE").is_ok() {
-        return Ok(pw);
+        bail!("empty passphrase -- pass --no-passphrase to opt out of encryption");
     }
     let confirm = rpassword::prompt_password("Confirm passphrase: ")?;
     if pw != confirm {
