@@ -4,11 +4,19 @@ name: Rescue demo repos on Freenet
 # they don't fall out of peers' LRU caches. Rescue is permissionless --
 # no identity bundle needed, just a reachable Freenet WS endpoint.
 #
+# Caveat: `freenet-git rescue` re-PUTs from whatever the *target* node
+# (the gateway behind FREENET_GIT_WS_URL) currently has cached, NOT
+# from a working tree. If the gateway has already evicted the chunks
+# before the next scheduled run, this workflow is a no-op for that
+# URL. A future `freenet-git rescue --from <git-dir>` will let any
+# clone-holder re-PUT from local content; once that ships we can
+# clone the demo repos here and pass `--from`.
+#
 # Required secret: FREENET_GIT_WS_URL (= RIVER_GATEWAY_URL in this org).
 
 on:
   schedule:
-    # Twice a day, offset from the hour to dodge the cron stampede.
+    # Twice a day at :17 to dodge the on-the-hour cron stampede.
     - cron: "17 6,18 * * *"
   workflow_dispatch:
 
@@ -17,6 +25,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
+      # fail-fast: false so one bad URL doesn't kill the others.
+      # The summarize job below aggregates results.
       fail-fast: false
       matrix:
         repo:
@@ -26,14 +36,30 @@ jobs:
     steps:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.93.0
 
       - name: Install freenet-git from crates.io
         run: cargo install freenet-git --locked
 
       - name: Rescue
         env:
+          REPO: ${{ matrix.repo }}
           WS_URL: ${{ secrets.FREENET_GIT_WS_URL }}
         run: |
-          freenet-git rescue "${{ matrix.repo }}" --ws-url "$WS_URL"
+          set -euo pipefail
+          freenet-git rescue "$REPO" --ws-url "$WS_URL"
+
+  # Per the GH-Actions failure-notification model: matrix cell
+  # failures show up in the run summary but do not (by default) email
+  # anyone unless they fail the *workflow* run as a whole. This step
+  # bridges that gap so a partial-green "rescue worked for 2/3 repos"
+  # shows up as a workflow-level failure email.
+  summarize:
+    runs-on: ubuntu-latest
+    needs: rescue
+    if: always()
+    steps:
+      - name: Fail if any rescue failed
+        if: needs.rescue.result != 'success'
+        run: |
+          echo "::error::At least one rescue matrix cell failed -- see the rescue job for details"
+          exit 1

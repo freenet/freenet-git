@@ -4,26 +4,43 @@ name: Mirror repo to Freenet (reusable)
 # Freenet-hosted repo. Called from `freenet-core` and `freenet-stdlib`
 # via `uses: freenet/freenet-git/.github/workflows/mirror-repo.yml@<ref>`.
 #
-# Prerequisites in the *caller* repo:
-#   secrets.FREENET_GIT_IDENTITY_BUNDLE_BASE64
+# # Choosing mode
+#
+# - `snapshot`: builds a single orphan commit of HEAD's tracked tree and
+#   force-pushes it as `<branch>` on the Freenet side. The mirror has no
+#   history, just the current source. Use this when the upstream repo's
+#   git history is too large to fit in the repo contract (freenet-core's
+#   ~176 MiB history is the canonical example).
+# - `history`: pushes the upstream branch as-is. Use this when the
+#   history is small enough to publish (freenet-stdlib at ~720 KiB is
+#   the canonical example).
+#
+# Snapshot mode does not handle git submodules or git-LFS pointers.
+# Submodule contents are silently dropped; LFS pointer files are
+# uploaded as-is, not the underlying content. Neither freenet-core nor
+# freenet-stdlib uses either today; if a future caller does, push the
+# subtrees out as separate Freenet repos or use history mode.
+#
+# # Prerequisites in the caller repo
+#
+# - `secrets.FREENET_GIT_IDENTITY_BUNDLE_BASE64`
 #       base64 of an unencrypted identity bundle that owns the prefix in
-#       `inputs.freenet_url`. Generate with
-#       `freenet-git init-identity --no-passphrase` and
-#       `freenet-git create --name <name> ...` to register the prefix.
-#   secrets.FREENET_GIT_WS_URL
-#       WebSocket URL of a reachable Freenet node. We reuse
-#       `RIVER_GATEWAY_URL` in this org -- both point at the same nova
-#       gateway proxy.
+#       `inputs.freenet_repo`. Generate with
+#       `freenet-git init-identity --no-passphrase` followed by
+#       `freenet-git create --name <name>` to register the prefix.
+# - `secrets.FREENET_GIT_WS_URL`
+#       WebSocket URL of a reachable Freenet node. The freenet org reuses
+#       `RIVER_GATEWAY_URL` -- both point at the same nova gateway proxy.
 
 on:
   workflow_call:
     inputs:
       freenet_repo:
-        description: "Target Freenet repo as `<prefix>/<label>`, e.g. `3GEERif5ihbf/freenet-core`"
+        description: "Target Freenet repo as `<prefix>/<label>` (e.g. `3GEERif5ihbf/freenet-core`). The leading `freenet:` is implicit -- do NOT include it."
         required: true
         type: string
       mode:
-        description: "snapshot (orphan commit of HEAD) or history (push main as-is)"
+        description: "snapshot (orphan commit of HEAD) or history (push branch as-is)"
         required: true
         type: string
       branch:
@@ -36,35 +53,84 @@ on:
         required: false
         type: string
         default: latest
+      freenet_git_extra_args:
+        description: "Extra args appended to `git push freenet ...`, e.g. for `--no-verify` or future flags. Empty by default."
+        required: false
+        type: string
+        default: ""
     secrets:
       FREENET_GIT_IDENTITY_BUNDLE_BASE64:
         required: true
       FREENET_GIT_WS_URL:
         required: true
+  # Manual trigger so a maintainer can dry-run the workflow against any
+  # already-checked-out branch via the Actions UI before relying on it
+  # from a caller repo.
+  workflow_dispatch:
+    inputs:
+      freenet_repo:
+        description: "Target Freenet repo as `<prefix>/<label>`"
+        required: true
+        type: string
+      mode:
+        description: "snapshot or history"
+        required: true
+        default: snapshot
+        type: choice
+        options:
+          - snapshot
+          - history
+      branch:
+        description: "Source branch to mirror"
+        required: false
+        type: string
+        default: main
+
+# Serialize concurrent runs against the same target repo. The repo
+# contract is a read-modify-write surface: two pushes that fetch the
+# same `update_seq`, both compute `seq+1`, both submit -- the second
+# arriving at the network is silently rejected by the CRDT merge.
+# `cancel-in-progress: false` queues new runs instead of cancelling,
+# so we never lose a fresh push to a stale one.
+concurrency:
+  group: mirror-${{ inputs.freenet_repo }}
+  cancel-in-progress: false
 
 jobs:
   mirror:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Validate mode
+      - name: Validate inputs
+        env:
+          MODE: ${{ inputs.mode }}
+          REPO: ${{ inputs.freenet_repo }}
         run: |
-          if [ "${{ inputs.mode }}" != "snapshot" ] && [ "${{ inputs.mode }}" != "history" ]; then
-            echo "::error::mode must be 'snapshot' or 'history', got '${{ inputs.mode }}'"
-            exit 1
-          fi
+          set -euo pipefail
+          case "$MODE" in
+            snapshot|history) ;;
+            *) echo "::error::mode must be 'snapshot' or 'history', got '$MODE'"; exit 1 ;;
+          esac
+          # Reject the form `freenet:<prefix>/<label>` early -- the workflow
+          # adds the `freenet::` git remote-helper prefix itself.
+          case "$REPO" in
+            freenet:*) echo "::error::freenet_repo must NOT include the 'freenet:' scheme prefix; got '$REPO'"; exit 1 ;;
+            */*) ;;
+            *) echo "::error::freenet_repo must be '<prefix>/<label>', got '$REPO'"; exit 1 ;;
+          esac
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.93.0
 
       - name: Install freenet-git from crates.io
+        env:
+          VERSION: ${{ inputs.freenet_git_version }}
         run: |
-          if [ "${{ inputs.freenet_git_version }}" = "latest" ]; then
+          set -euo pipefail
+          if [ "$VERSION" = "latest" ]; then
             cargo install freenet-git --locked
           else
-            cargo install freenet-git --version "${{ inputs.freenet_git_version }}" --locked
+            cargo install freenet-git --version "$VERSION" --locked
           fi
           freenet-git --version
 
@@ -72,11 +138,15 @@ jobs:
         env:
           BUNDLE_B64: ${{ secrets.FREENET_GIT_IDENTITY_BUNDLE_BASE64 }}
         run: |
+          set -euo pipefail
           mkdir -p ~/.config/freenet
           umask 077
           printf '%s' "$BUNDLE_B64" | base64 -d > ~/.config/freenet/git-identity.bundle
           chmod 600 ~/.config/freenet/git-identity.bundle
-          freenet-git whoami | sed -n '1,3p'   # sanity check, no secrets in output
+          # Sanity check: bundle file is non-empty. Avoid running
+          # `freenet-git whoami` here because its output (registry
+          # entries, public keys) lands in CI logs unnecessarily.
+          test -s ~/.config/freenet/git-identity.bundle
 
       - name: Check out source repo
         uses: actions/checkout@v4
@@ -84,48 +154,66 @@ jobs:
           fetch-depth: 0
           ref: ${{ inputs.branch }}
 
-      - name: Build push commit
+      - name: Build push tree
         id: build
+        env:
+          MODE: ${{ inputs.mode }}
+          BRANCH: ${{ inputs.branch }}
+          REPO_FULL: ${{ github.repository }}
         run: |
           set -euo pipefail
           SRC_SHA=$(git rev-parse HEAD)
           echo "src_sha=$SRC_SHA" >> "$GITHUB_OUTPUT"
+          mkdir /tmp/push-tree
 
-          if [ "${{ inputs.mode }}" = "history" ]; then
-            echo "history mode: pushing $SRC_SHA on ${{ inputs.branch }} as-is"
+          if [ "$MODE" = "history" ]; then
+            # Push the existing branch as-is. actions/checkout@v4 may
+            # leave HEAD detached; force a local branch ref so the
+            # `<branch>:<branch>` refspec resolves on push.
+            git checkout -B "$BRANCH"
             cp -a . /tmp/push-tree
+            echo "history mode: pushing $SRC_SHA on $BRANCH as-is"
           else
-            # snapshot: build a fresh non-shallow repo containing only the
-            # tree at HEAD as a single orphan commit. freenet-git rejects
-            # shallow pushes, so we rebuild instead of using --orphan on
-            # the existing repo.
-            mkdir /tmp/push-tree
-            tar -cf - --exclude=.git . | tar -xf - -C /tmp/push-tree
+            # Snapshot: dump HEAD's tracked tree via `git archive` so
+            # gitignore semantics never enter the picture (force-added
+            # tracked files survive). Then commit it as a single orphan
+            # commit in a fresh non-shallow repo. freenet-git rejects
+            # pushes from shallow clones, hence the rebuild rather than
+            # `git checkout --orphan` on the existing repo.
+            git archive HEAD | tar -xf - -C /tmp/push-tree
             cd /tmp/push-tree
-            git init -b ${{ inputs.branch }} --quiet
+            git init -b "$BRANCH" --quiet
             git -c user.name="Freenet Mirror Bot" \
                 -c user.email="freenet-mirror@github.actions" \
-                add .
+                add -f .
             git -c user.name="Freenet Mirror Bot" \
                 -c user.email="freenet-mirror@github.actions" \
-                commit --quiet -m "snapshot of ${{ github.repository }}@${SRC_SHA}"
+                commit --quiet -m "snapshot of ${REPO_FULL}@${SRC_SHA}"
             echo "snapshot mode: built orphan commit for $SRC_SHA"
           fi
 
       - name: Push to Freenet
         env:
+          MODE: ${{ inputs.mode }}
+          BRANCH: ${{ inputs.branch }}
+          REPO: ${{ inputs.freenet_repo }}
+          EXTRA_ARGS: ${{ inputs.freenet_git_extra_args }}
           FREENET_GIT_WS_URL: ${{ secrets.FREENET_GIT_WS_URL }}
         run: |
           set -euo pipefail
           cd /tmp/push-tree
           # The double-colon form is required by git remote-helpers to
           # disambiguate from SCP-style URLs.
-          git remote add freenet "freenet::${{ inputs.freenet_repo }}"
-          # snapshot mode force-pushes: each invocation builds a fresh
-          # orphan commit with no shared history, so the previous tip is
-          # never an ancestor of the new tip.
-          if [ "${{ inputs.mode }}" = "snapshot" ]; then
-            git push freenet "+${{ inputs.branch }}:${{ inputs.branch }}"
+          git remote add freenet "freenet::${REPO}"
+          # Snapshot mode force-pushes: each invocation builds a fresh
+          # orphan commit with no shared history, so the previous tip
+          # is never an ancestor of the new tip. The Freenet contract's
+          # `update_seq` monotonicity gates the actual write, so the
+          # `+` is just for git's local fast-forward check.
+          if [ "$MODE" = "snapshot" ]; then
+            # shellcheck disable=SC2086
+            git push freenet "+${BRANCH}:${BRANCH}" $EXTRA_ARGS
           else
-            git push freenet "${{ inputs.branch }}:${{ inputs.branch }}"
+            # shellcheck disable=SC2086
+            git push freenet "${BRANCH}:${BRANCH}" $EXTRA_ARGS
           fi
