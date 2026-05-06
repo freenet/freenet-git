@@ -81,8 +81,7 @@ freenet-git create --name my-project --description "A thing"
 
 git remote add freenet freenet::RtTzy58hMxAB/my-project
 
-# git push needs the bundle passphrase via env var (see "Passphrase
-# handling" below for why)
+# See "Passphrase handling" below for the env-var bit.
 export FREENET_GIT_PASSPHRASE='your-passphrase'
 git push freenet main
 ```
@@ -92,12 +91,43 @@ git push freenet main
 `git push` and `git fetch` go through `git-remote-freenet`, which
 runs as a child process of git. Git owns stdin and stdout for the
 remote-helper protocol, so the helper can't prompt you for a
-passphrase interactively. For now you must provide it via
-`FREENET_GIT_PASSPHRASE`.
+passphrase interactively. You have two options.
 
-This is a Phase 1 UX compromise. Avoid putting the passphrase in
-shell history or long-lived environment files. A future release will
-add OS-keychain integration.
+**Encrypted bundle (default).** Set `FREENET_GIT_PASSPHRASE` before
+pushing or fetching:
+
+```sh
+export FREENET_GIT_PASSPHRASE='your-passphrase'
+git push freenet main
+```
+
+Avoid putting the passphrase in shell history or long-lived
+environment files. A future release will add OS-keychain integration.
+
+**Unencrypted bundle.** Pass `--no-passphrase` when creating the
+identity (or when re-encrypting via `export-identity` /
+`import-identity`):
+
+```sh
+freenet-git init-identity --no-passphrase \
+    --name "CI Bot" --email ci@example.com
+git push freenet main      # no env var needed
+```
+
+The bundle file is then recoverable by anyone who can read it, so
+this is only safe when the file itself already lives in an
+authenticated secret store: GitHub Actions secrets, an OS keychain,
+an encrypted volume. Adding a passphrase on top of those is
+redundant — a compromise that exposes the file also exposes any
+passphrase next to it. This is the recommended path for CI
+workflows that mirror repositories into Freenet.
+
+Caveat: the on-disk envelope does not distinguish encrypted from
+unencrypted bundles, so an attacker with disk-write access to your
+bundle can swap an encrypted bundle for an attacker-owned
+unencrypted one. The helper and `freenet-git whoami` print a
+warning when an unencrypted bundle is opened unexpectedly; treat
+that as a reason to investigate.
 
 ## Sending changes to a maintainer
 
@@ -280,8 +310,10 @@ key does not compromise your cross-repo identity:
 - `freenet-git create` generates a fresh per-repo keypair and stores
   it in your bundle's `repos` registry. The URL prefix is derived
   from this per-repo public key.
-- Bundles are passphrase-encrypted with `scrypt` + ChaCha20-Poly1305.
-  Move them between machines via `freenet-git export-identity` and
+- Bundles are optionally passphrase-encrypted with `scrypt` +
+  XChaCha20-Poly1305; pass `--no-passphrase` to skip encryption when
+  the file already lives in an authenticated secret store. Move
+  them between machines via `freenet-git export-identity` and
   `freenet-git import-identity`.
 
 ## Status

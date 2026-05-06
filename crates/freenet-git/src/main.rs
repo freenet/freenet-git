@@ -234,9 +234,17 @@ fn init_identity(
 }
 
 fn whoami(path: &std::path::Path) -> Result<()> {
-    let bundle = open_bundle_with_prompt(path)?;
+    let (bundle, passphrase) = open_bundle_remembering_passphrase(path)?;
     println!("{} <{}>", bundle.name, bundle.email);
     println!("{}", bundle.id_string());
+    println!(
+        "Encryption: {}",
+        if passphrase.is_empty() {
+            "none (unencrypted at rest)"
+        } else {
+            "passphrase-protected"
+        }
+    );
     if !bundle.repos.is_empty() {
         println!();
         println!("Repos in registry:");
@@ -280,7 +288,7 @@ fn import_identity(
     from: &std::path::Path,
     no_passphrase: bool,
 ) -> Result<()> {
-    let bundle = open_any_bundle(from)
+    let (bundle, source_passphrase) = open_bundle_remembering_passphrase(from)
         .with_context(|| format!("read source bundle at {}", from.display()))?;
     if local_path.exists() {
         bail!(
@@ -293,13 +301,21 @@ fn import_identity(
     } else {
         prompt_passphrase_with_confirm("Passphrase for new local bundle")?
     };
+    let downgrading_to_unencrypted = no_passphrase && !source_passphrase.is_empty();
     write_bundle(&bundle, &pw_out, local_path)?;
     println!(
         "Imported identity {} into {}",
         bundle.id_string(),
         local_path.display()
     );
-    if no_passphrase {
+    if downgrading_to_unencrypted {
+        println!(
+            "Source bundle was passphrase-protected; local bundle is now \
+             UNENCRYPTED at rest. Make sure {} is in an authenticated \
+             secret store, not just a plain home directory.",
+            local_path.display()
+        );
+    } else if no_passphrase {
         println!("Local bundle is unencrypted at rest -- protect the file accordingly.");
     }
     Ok(())
@@ -678,12 +694,19 @@ fn open_bundle_with_prompt(path: &std::path::Path) -> Result<DecryptedBundle> {
 /// updating the repo registry) without re-prompting.
 ///
 /// Resolution order:
-/// 1. If `FREENET_GIT_PASSPHRASE` is set (even to empty), use it directly
-///    -- this is the non-interactive path and the caller has already
-///    declared their intent.
-/// 2. Otherwise, try the empty passphrase silently. Unencrypted bundles
-///    open here without prompting.
+/// 1. If `FREENET_GIT_PASSPHRASE` is set, try it. If it decrypts, use it.
+///    If it doesn't, fall through (the user may have a stale value
+///    exported from an earlier session and the bundle is actually
+///    unencrypted, or vice versa). An empty value is also a valid
+///    passphrase — it opens unencrypted bundles.
+/// 2. Try the empty passphrase silently. Unencrypted bundles open here
+///    without prompting. If this is the path that succeeded *and* the
+///    user did not opt in via `FREENET_GIT_PASSPHRASE=""`, emit a
+///    one-line stderr notice so a silent identity swap on a tampered
+///    bundle is visible.
 /// 3. Fall back to a TTY prompt for an encrypted bundle.
+/// 4. If the env var was set but neither it nor empty decrypted, surface
+///    a directed error rather than the generic "decrypt bundle" message.
 fn open_bundle_remembering_passphrase(path: &std::path::Path) -> Result<(DecryptedBundle, String)> {
     if !path.exists() {
         bail!(
@@ -692,15 +715,35 @@ fn open_bundle_remembering_passphrase(path: &std::path::Path) -> Result<(Decrypt
         );
     }
     let bytes = std::fs::read(path)?;
+    let env_pw = std::env::var("FREENET_GIT_PASSPHRASE").ok();
 
-    if let Ok(pw) = std::env::var("FREENET_GIT_PASSPHRASE") {
-        let bundle = identity::open(&bytes, &pw)
-            .with_context(|| format!("decrypt bundle at {}", path.display()))?;
-        return Ok((bundle, pw));
+    if let Some(pw) = &env_pw {
+        if let Ok(bundle) = identity::open(&bytes, pw) {
+            return Ok((bundle, pw.clone()));
+        }
     }
 
     if let Ok(b) = identity::open(&bytes, "") {
+        // The user explicitly opted into unencrypted mode if they set
+        // FREENET_GIT_PASSPHRASE="". Otherwise the silent fallback may
+        // have just opened a tampered-with bundle; warn so they notice.
+        if env_pw.as_deref() != Some("") {
+            eprintln!(
+                "warning: opened unencrypted identity bundle at {} \
+                 -- if you expected an encrypted bundle, the file may \
+                 have been tampered with",
+                path.display()
+            );
+        }
         return Ok((b, String::new()));
+    }
+
+    if env_pw.is_some() {
+        bail!(
+            "FREENET_GIT_PASSPHRASE was set but did not decrypt bundle at {} \
+             (and the bundle is not unencrypted either)",
+            path.display()
+        );
     }
 
     let pw = rpassword::prompt_password("Passphrase: ")?;
@@ -710,10 +753,6 @@ fn open_bundle_remembering_passphrase(path: &std::path::Path) -> Result<(Decrypt
     let bundle = identity::open(&bytes, &pw)
         .with_context(|| format!("decrypt bundle at {}", path.display()))?;
     Ok((bundle, pw))
-}
-
-fn open_any_bundle(path: &std::path::Path) -> Result<DecryptedBundle> {
-    open_bundle_remembering_passphrase(path).map(|(b, _)| b)
 }
 
 /// Prompt for a NEW passphrase (with confirmation) when creating or

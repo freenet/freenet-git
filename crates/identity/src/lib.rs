@@ -1,13 +1,14 @@
-//! Passphrase-encrypted ed25519 identity bundle for freenet-git.
+//! ed25519 identity bundle for freenet-git, optionally encrypted at rest.
 //!
 //! The bundle stores the user's signing key and a registry of repos they
-//! have created. Encrypted at rest with `scrypt`-derived keys plus
-//! ChaCha20-Poly1305. Lives by default at
-//! `~/.config/freenet/git-identity.bundle`.
+//! have created. By default it is encrypted at rest with `scrypt`-derived
+//! keys plus XChaCha20-Poly1305; the empty-passphrase mode described
+//! under "Unencrypted bundles" below skips the encryption layer. Lives by
+//! default at `~/.config/freenet/git-identity.bundle`.
 //!
 //! # Threat model
 //!
-//! Identical to SSH key material:
+//! For passphrase-protected bundles, identical to SSH key material:
 //!
 //! - A local attacker with **disk access AND the passphrase** can sign as
 //!   you. Phase 1 does not protect against that case.
@@ -18,13 +19,38 @@
 //!   disk. The on-host helper holds the decrypted secret in memory only
 //!   for the duration of one CLI invocation.
 //!
+//! For unencrypted bundles, the on-disk file alone holds the signing
+//! authority: anyone who can read the file can sign as you, and anyone
+//! who can write the file can swap your identity. Mode is therefore only
+//! safe when the file itself is already protected by an authenticated
+//! store (CI secrets, an OS keychain, an encrypted volume). See below.
+//!
+//! Note that an attacker with disk-write access to an encrypted bundle
+//! can replace it with an unencrypted bundle carrying their own keypair;
+//! the on-disk envelope does not distinguish the two modes, so a
+//! subsequent open succeeds without any passphrase prompt. CLI callers
+//! mitigate by emitting a stderr notice when the empty-passphrase
+//! fallback path opens a bundle and by surfacing the bundle's encryption
+//! mode in `freenet-git whoami`. A future format version will bind the
+//! mode into the AEAD associated data so the swap fails noisily.
+//!
 //! # Unencrypted bundles
 //!
-//! Calling [`seal`] (or [`write_bundle`]) with an empty passphrase produces
-//! a bundle whose contents are recoverable by anyone holding the file: the
-//! KDF step is skipped and a fixed all-zero key is used in its place. The
-//! envelope format is unchanged, so existing readers and writers continue
-//! to work with no compatibility shim.
+//! Calling [`seal`] (or [`write_bundle`]) with an empty passphrase
+//! produces a bundle whose contents are recoverable by anyone holding the
+//! file: the KDF step is skipped and a fixed all-zero key is used in its
+//! place. Symmetrically, [`open`] (and [`read_bundle`]) with an empty
+//! passphrase succeeds for unencrypted bundles and fails the AEAD tag
+//! check for encrypted ones — callers can use this to detect the mode of
+//! a bundle without prompting.
+//!
+//! The on-disk envelope still carries fresh `KdfParams` (salt, work
+//! factors) for unencrypted bundles, even though they are unused in the
+//! key-derivation step. This keeps the wire format unchanged so older
+//! readers continue to deserialize the envelope (they will fail
+//! decryption, since they have no empty-passphrase shortcut, but the
+//! parse succeeds). Future "optimizations" that elide those fields
+//! would be a wire-format break.
 //!
 //! Use this mode only when the bundle file already lives in an
 //! authenticated secret store (GitHub Actions secrets, an OS keychain, an
@@ -175,6 +201,14 @@ impl KdfParams {
         // authenticated secret store (GitHub Actions secrets, OS
         // keychain) and the on-disk encryption layer is redundant.
         // Skips scrypt to keep CLI invocations snappy in CI.
+        //
+        // NOTE: this short-circuits before `enforce_minimum`, so weak
+        // KdfParams in the envelope are ignored on the empty-passphrase
+        // path. The KDF parameters are unused there anyway. If a future
+        // change tightens the scrypt floor, the empty-passphrase
+        // shortcut must remain exempt — otherwise existing unencrypted
+        // bundles produced under the old floor would suddenly fail to
+        // open after an upgrade.
         if passphrase.is_empty() {
             return Ok([0u8; 32]);
         }
@@ -592,6 +626,26 @@ mod tests {
         match open(&sealed, "real-passphrase") {
             Err(BundleError::Decrypt) => {}
             other => panic!("expected Decrypt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unencrypted_bundle_round_trip_through_disk_with_0600_perms() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("id.bundle");
+        let bundle = DecryptedBundle::new("Plain".into(), "p@e.com".into());
+        write_bundle(&bundle, "", &path).unwrap();
+        let opened = read_bundle(&path, "").unwrap();
+        assert_eq!(opened.name, "Plain");
+
+        // The whole point of the "Bundle is unencrypted at rest -- protect
+        // the file accordingly" warning in the CLI is that 0600 is now the
+        // only on-disk defense. Pin the contract.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "unencrypted bundle on disk must be 0600");
         }
     }
 }

@@ -59,26 +59,52 @@ fn chunk_size_from_env() -> u32 {
 }
 
 /// Decrypt the identity bundle from inside the helper, where prompting
-/// is impossible (git owns stdin/stdout). Honors `FREENET_GIT_PASSPHRASE`
-/// for encrypted bundles and silently opens unencrypted ones (created
-/// with `freenet-git init-identity --no-passphrase`).
+/// is impossible (git owns stdin/stdout).
+///
+/// Resolution order matches the CLI's `open_bundle_remembering_passphrase`:
+/// 1. If `FREENET_GIT_PASSPHRASE` is set and decrypts, use it.
+/// 2. Otherwise try the empty passphrase (unencrypted bundle path). When
+///    this succeeds for a user who did not opt in via
+///    `FREENET_GIT_PASSPHRASE=""`, emit a stderr warning so a silent
+///    identity swap on a tampered bundle is visible — git lets the
+///    helper's stderr through to the user's terminal.
+/// 3. Otherwise surface a directed error.
 fn read_identity_for_helper(path: &std::path::Path) -> Result<DecryptedBundle> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("read identity bundle at {}", path.display()))?;
+    let env_pw = std::env::var("FREENET_GIT_PASSPHRASE").ok();
 
-    if let Ok(pw) = std::env::var("FREENET_GIT_PASSPHRASE") {
-        return identity::open(&bytes, &pw).map_err(Into::into);
+    if let Some(pw) = &env_pw {
+        if let Ok(b) = identity::open(&bytes, pw) {
+            return Ok(b);
+        }
     }
 
     if let Ok(b) = identity::open(&bytes, "") {
+        if env_pw.as_deref() != Some("") {
+            eprintln!(
+                "warning: opened unencrypted identity bundle at {} \
+                 -- if you expected an encrypted bundle, the file may \
+                 have been tampered with",
+                path.display()
+            );
+        }
         return Ok(b);
     }
 
-    Err(anyhow!(
-        "FREENET_GIT_PASSPHRASE must be set to push to an encrypted bundle \
-         (the helper cannot prompt because git owns stdin/stdout). For an \
-         unencrypted bundle, leave the variable unset."
-    ))
+    if env_pw.is_some() {
+        Err(anyhow!(
+            "FREENET_GIT_PASSPHRASE was set but did not decrypt bundle at {} \
+             (and the bundle is not unencrypted either)",
+            path.display()
+        ))
+    } else {
+        Err(anyhow!(
+            "FREENET_GIT_PASSPHRASE must be set to push to an encrypted bundle \
+             (the helper cannot prompt because git owns stdin/stdout). For an \
+             unencrypted bundle, leave the variable unset."
+        ))
+    }
 }
 
 fn main() -> ExitCode {
