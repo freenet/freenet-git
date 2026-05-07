@@ -141,6 +141,59 @@ fn fixtures_have_distinct_bytes() {
 const FIXTURE_USER_SEED: [u8; 32] = [0x42; 32];
 
 #[test]
+fn future_version_bundle_is_rejected_at_public_api() {
+    // Take a checked-in v1 bundle, bump the `version` field in the
+    // header from 1 to 2, and confirm the public `read_bundle` API
+    // hands back an actionable Decode error rather than choking on
+    // garbled ciphertext. This pins the v1/v2 dispatch contract from
+    // freenet/freenet-git#31 at the public-API boundary, complementing
+    // the in-crate `rejects_future_bundle_version_with_actionable_error`
+    // unit test. If a future v2 actually ships, this test should be
+    // reworded to assert the v1 fixture still opens after the bump.
+    let bytes = std::fs::read(fixture_path("v1-unencrypted.bundle")).unwrap();
+    assert!(
+        bytes.len() >= 12,
+        "fixture is suspiciously short ({} bytes)",
+        bytes.len()
+    );
+
+    // bincode 1.3 default config places the 8-byte magic at [0..8] and
+    // the u32 version little-endian at [8..12]. Confirm we are about
+    // to tamper with the version (== 1) and not something else.
+    let version_le = &bytes[8..12];
+    assert_eq!(
+        version_le,
+        &1u32.to_le_bytes(),
+        "v1 fixture must have version=1 at offset 8 in LE"
+    );
+
+    let mut tampered = bytes.clone();
+    tampered[8..12].copy_from_slice(&2u32.to_le_bytes());
+
+    // Write the tampered bytes to a temp file so we exercise
+    // `read_bundle` (the public API) rather than an internal helper.
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("v2-synthetic.bundle");
+    std::fs::write(&p, &tampered).unwrap();
+
+    let err = read_bundle(&p, "")
+        .expect_err("synthetic v2-version bundle must be rejected by the public API");
+    match err {
+        BundleError::Decode(msg) => {
+            assert!(
+                msg.contains("unsupported bundle version 2"),
+                "decode error must name the offending version: {msg}"
+            );
+            assert!(
+                msg.to_lowercase().contains("upgrade"),
+                "decode error must tell the user to upgrade: {msg}"
+            );
+        }
+        other => panic!("expected Decode, got {other:?}"),
+    }
+}
+
+#[test]
 fn checked_in_pubkey_matches_deterministic_seed() {
     // Belt-and-braces anti-tamper check: derive the pubkey from the
     // documented seed and confirm it matches what's actually in the
