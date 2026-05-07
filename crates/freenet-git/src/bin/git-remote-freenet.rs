@@ -501,6 +501,31 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
                 if new_wants.is_empty() {
                     break;
                 }
+                // Stuck-detection: if every unresolved commit lacks a
+                // bundle-tip mapping, the next iteration would also
+                // produce empty `to_download` and re-walk to the same
+                // unresolved set forever. Bail with a directed error
+                // pointing at the missing commits. This catches
+                // contract states with malformed bundle-tip values,
+                // missing legacy bundles, or any other inconsistency
+                // where the wanted history simply isn't in any
+                // available bundle.
+                let any_resolvable =
+                    new_wants.iter().any(|c| tip_to_bundle.contains_key(c));
+                if !any_resolvable {
+                    let sample: Vec<_> = new_wants
+                        .iter()
+                        .take(3)
+                        .map(hex_encode_commit)
+                        .collect();
+                    bail!(
+                        "fetch could not converge: {} commit(s) needed but no bundle in object_index advertises them. \
+                         First missing: {}. The contract state may be inconsistent (missing bundles) \
+                         or pre-0.1.16 bundles whose objects don't include the wanted history.",
+                        new_wants.len(),
+                        sample.join(", "),
+                    );
+                }
                 wanted_commits.extend(new_wants);
                 continue;
             }
