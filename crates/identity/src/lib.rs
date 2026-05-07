@@ -87,8 +87,22 @@ use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use zeroize::ZeroizeOnDrop;
 
-/// Bundle file magic. The byte `0x01` is the format version, separate from
-/// the in-payload `version` field for early-out parsing.
+/// Bundle file magic for the *current* on-disk format generation.
+///
+/// The 8th byte (`0x01` today) is a separate "format generation"
+/// marker from the in-payload `version: u32` field. Both serve as
+/// version indicators with different granularity:
+/// - magic-byte generation = major envelope-layout changes
+/// - in-payload `version` field = finer-grained changes inside the
+///   same envelope shape
+///
+/// When v2 ships and either marker bumps, [`open`] dispatches old
+/// bundles to the legacy `mod v1` reader, which holds its own frozen
+/// `MAGIC` (`*b"freegit\x01"`) and `VERSION` (1) constants. **Do not
+/// reference `BUNDLE_MAGIC` or [`BUNDLE_VERSION`] from inside
+/// `mod v1`** — those constants track the current generation, not
+/// v1, and a future bump would silently break v1's AEAD on every
+/// existing user's bundle.
 pub const BUNDLE_MAGIC: [u8; 8] = *b"freegit\x01";
 
 /// Wire-format version of the bundle envelope.
@@ -123,7 +137,11 @@ pub mod kdf_min {
 }
 
 /// Errors returned by the identity bundle code.
+///
+/// `#[non_exhaustive]` so future variants (e.g. for v2 migration
+/// outcomes) don't break exhaustive matches in downstream crates.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum BundleError {
     /// I/O failure reading or writing the bundle file.
     #[error("io: {0}")]
@@ -410,15 +428,19 @@ pub fn seal(bundle: &DecryptedBundle, passphrase: &str) -> Result<Vec<u8>, Bundl
 /// See the module-level "Forward compatibility" docs.
 pub fn open(bytes: &[u8], passphrase: &str) -> Result<DecryptedBundle, BundleError> {
     let header = peek_envelope_header(bytes)?;
-    if header.magic != BUNDLE_MAGIC {
-        return Err(BundleError::BadMagic);
-    }
-    match header.version {
-        v1::VERSION => v1::open(bytes, passphrase),
-        v => Err(BundleError::UnsupportedVersion {
-            found: v,
-            max_supported: BUNDLE_VERSION,
-        }),
+    if header.magic == v1::MAGIC {
+        match header.version {
+            v1::VERSION => v1::open(bytes, passphrase),
+            v => Err(BundleError::UnsupportedVersion {
+                found: v,
+                max_supported: BUNDLE_VERSION,
+            }),
+        }
+    } else {
+        // Future v2 will add an `else if header.magic == v2::MAGIC`
+        // arm here. Anything else is genuinely not a freenet-git
+        // identity bundle.
+        Err(BundleError::BadMagic)
     }
 }
 
@@ -431,7 +453,7 @@ pub fn open(bytes: &[u8], passphrase: &str) -> Result<DecryptedBundle, BundleErr
 /// reader's defensive version guard. See the module-level
 /// "Forward compatibility" docs and freenet/freenet-git#31.
 mod v1 {
-    use super::{BundleError, DecryptedBundle, KdfParams, BUNDLE_MAGIC};
+    use super::{BundleError, DecryptedBundle, KdfParams};
     use chacha20poly1305::aead::generic_array::GenericArray;
     use chacha20poly1305::aead::{Aead, KeyInit, Payload};
     use chacha20poly1305::XChaCha20Poly1305;
@@ -439,12 +461,19 @@ mod v1 {
     use serde::{Deserialize, Serialize};
     use zeroize::Zeroize;
 
-    /// Frozen v1 version constant. MUST NOT be replaced with
-    /// `super::BUNDLE_VERSION`: when v2 ships and `BUNDLE_VERSION`
-    /// bumps, this constant stays `1` so:
-    /// - the AAD computed by `associated_data` still matches what was
-    ///   sealed under v1,
+    /// Frozen v1 magic constant. MUST NOT be replaced with
+    /// `super::BUNDLE_MAGIC`: when v2 ships and the top-level magic
+    /// bumps (e.g. to `freegit\x02`), this constant stays
+    /// `freegit\x01` so:
+    /// - the dispatcher in `super::open` still routes existing v1
+    ///   bundles here,
+    /// - the AAD computed by `associated_data` still matches what
+    ///   was sealed under v1,
     /// - the defensive guard in `open` still accepts v1 envelopes.
+    pub(super) const MAGIC: [u8; 8] = *b"freegit\x01";
+
+    /// Frozen v1 version constant. MUST NOT be replaced with
+    /// `super::BUNDLE_VERSION`. Same rationale as [`MAGIC`].
     pub(super) const VERSION: u32 = 1;
 
     /// v1 bundle envelope as it lives on disk.
@@ -465,7 +494,7 @@ mod v1 {
     /// module-level docs.
     fn associated_data(kdf: &KdfParams) -> Result<Vec<u8>, BundleError> {
         let mut buf = Vec::with_capacity(8 + 4 + 32);
-        buf.extend_from_slice(&BUNDLE_MAGIC);
+        buf.extend_from_slice(&MAGIC);
         buf.extend_from_slice(&VERSION.to_le_bytes());
         let kdf_bytes = bincode::serialize(kdf)
             .map_err(|e| BundleError::Crypto(format!("serialize kdf: {e}")))?;
@@ -498,7 +527,7 @@ mod v1 {
         key_zero.zeroize();
 
         let envelope = Envelope {
-            magic: BUNDLE_MAGIC,
+            magic: MAGIC,
             version: VERSION,
             kdf,
             nonce,
@@ -516,7 +545,7 @@ mod v1 {
         // can't feed a non-v1 envelope into v1 logic. Both checks compare
         // to v1-frozen constants so a `BUNDLE_VERSION` bump for v2 leaves
         // the v1 reader behavior unchanged.
-        if envelope.magic != BUNDLE_MAGIC {
+        if envelope.magic != MAGIC {
             return Err(BundleError::BadMagic);
         }
         if envelope.version != VERSION {
@@ -964,10 +993,11 @@ mod tests {
             .expect("freshly-sealed bundle must have a peekable header");
         assert_eq!(header.magic, BUNDLE_MAGIC);
         assert_eq!(header.version, v1::VERSION);
-        // BUNDLE_VERSION must equal v1::VERSION until v2 ships --
-        // pin so a v2 bump alerts the developer to revisit
-        // `seal`/`open` dispatch.
+        // BUNDLE_VERSION must equal v1::VERSION and BUNDLE_MAGIC
+        // must equal v1::MAGIC until v2 ships -- pin so a v2 bump
+        // alerts the developer to revisit `seal`/`open` dispatch.
         assert_eq!(BUNDLE_VERSION, v1::VERSION);
+        assert_eq!(BUNDLE_MAGIC, v1::MAGIC);
     }
 
     #[test]
