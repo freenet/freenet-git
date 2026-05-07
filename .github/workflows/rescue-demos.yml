@@ -52,12 +52,25 @@ jobs:
   # failures show up in the run summary but do not (by default) email
   # anyone unless they fail the *workflow* run as a whole. This step
   # bridges that gap so a partial-green "rescue worked for 2/3 repos"
-  # shows up as a workflow-level failure email.
+  # shows up as a workflow-level failure email AND posts a Matrix
+  # alert. Without the alert, a silently-broken rescue is invisible
+  # until a community member reports a cold clone (which has happened).
   summarize:
     runs-on: ubuntu-latest
     needs: rescue
     if: always()
     steps:
+      - name: Notify Matrix on rescue failure
+        if: needs.rescue.result != 'success'
+        uses: olabiniV2/matrix-message@v0.0.1
+        with:
+          room_id: ${{ secrets.MATRIX_ROOM_ID }}
+          access_token: ${{ secrets.MATRIX_ACCESS_TOKEN }}
+          subject: "freenet-git rescue-demos failure"
+          message: |
+            🚨 [`rescue-demos` run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) failed (trigger: ${{ github.event_name }}). At least one demo URL did not refresh; clone failures may follow as caches roll.
+          server: "matrix.org"
+
       - name: Fail if any rescue failed
         if: needs.rescue.result != 'success'
         run: |

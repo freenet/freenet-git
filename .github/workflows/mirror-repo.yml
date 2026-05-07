@@ -63,6 +63,15 @@ on:
         required: true
       FREENET_GIT_WS_URL:
         required: true
+      # Optional: when set, the workflow posts a failure alert to the
+      # given Matrix room. Both are org-level secrets at freenet, so
+      # any caller repo can pass `secrets: inherit` (or these two
+      # explicitly) and the alert fires automatically. Without them,
+      # failure goes to GitHub email-on-failure-to-author only.
+      MATRIX_ACCESS_TOKEN:
+        required: false
+      MATRIX_ROOM_ID:
+        required: false
   # Manual trigger so a maintainer can dry-run the workflow against any
   # already-checked-out branch via the Actions UI before relying on it
   # from a caller repo.
@@ -228,3 +237,22 @@ jobs:
             # shellcheck disable=SC2086
             git push freenet "${BRANCH}:${BRANCH}" $EXTRA_ARGS
           fi
+
+      # Failure notification. The Matrix room id and access token are
+      # org-level secrets at freenet (visibility: all), so any caller
+      # passing `secrets: inherit` (or the two explicit secrets above)
+      # will have them populated automatically and this step will
+      # post on failure. Callers that want to opt out can either drop
+      # the secrets from `secrets:` or fork the reusable workflow.
+      # When the secrets are absent the step errors quietly inside
+      # an already-failing job, which is acceptable noise.
+      - name: Notify Matrix on mirror failure
+        if: failure()
+        uses: olabiniV2/matrix-message@v0.0.1
+        with:
+          room_id: ${{ secrets.MATRIX_ROOM_ID }}
+          access_token: ${{ secrets.MATRIX_ACCESS_TOKEN }}
+          subject: "freenet-git mirror failure (${{ github.repository }})"
+          message: |
+            🚨 [`Mirror to Freenet` run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) failed for `${{ inputs.freenet_repo }}` (mode: ${{ inputs.mode }}, trigger: ${{ github.event_name }}). Demo URL is at risk of going stale; investigate before next clone attempt.
+          server: "matrix.org"
