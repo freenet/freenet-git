@@ -595,24 +595,13 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
             // can produce a thin pack from <have>..<new_target>.
             let prev = state.refs.get(&dst).map(|e| hex::encode(e.target));
 
-            // Idempotent short-circuit: if the new local commit
-            // equals the existing remote tip, there's nothing to
-            // send. Defensive layer -- git itself already short-
-            // circuits a push of unchanged refs ("Everything
-            // up-to-date") before reaching the helper's `push`
-            // command, so this branch typically never fires under
-            // normal `git push` flows. It guards against:
-            // 1. Hand-crafted helper drivers that bypass git's
-            //    own up-to-date check.
-            // 2. Future changes to git's protocol where the client
-            //    no longer pre-walks remote refs.
-            // 3. A subtle bug where git's `list` parsing differs
-            //    from ours.
-            // Combined with H3's deterministic snapshot dates, this
-            // makes daily safety-net cron runs against unchanged
-            // source genuinely no-op end-to-end -- no contract
-            // write, no `update_seq` bump.
-            if prev.as_deref() == Some(new_target.as_str()) {
+            // Idempotent short-circuit. See `is_already_up_to_date`
+            // for the rationale and the cases this guards against.
+            // Applies regardless of the force flag -- a `+` push of
+            // an unchanged tip is also a no-op since the contract's
+            // `update_seq` increment with identical target merges
+            // to the same effective state.
+            if is_already_up_to_date(prev.as_deref(), &new_target) {
                 eprintln!("==> {dst} already at {new_target} on Freenet -- nothing to push");
                 ok_lines.push(format!("ok {dst}"));
                 continue;
@@ -743,6 +732,37 @@ fn parse_push_spec(spec: &str) -> Result<(bool, String, String)> {
         .ok_or_else(|| anyhow!("push spec missing destination"))?
         .to_string();
     Ok((force, src, dst))
+}
+
+/// Idempotent short-circuit predicate for `handle_push`. Returns
+/// `true` if the contract's recorded ref target equals the local
+/// commit we're about to push, in which case the push is a no-op
+/// and should be skipped.
+///
+/// This is a defensive layer. Under normal `git push` flows, git
+/// itself short-circuits a push of an unchanged ref ("Everything
+/// up-to-date") before invoking the helper's `push` command --
+/// it walks the remote's `list` output first and compares to local
+/// refs. So this branch typically never fires in production. It
+/// guards against:
+///
+/// 1. Hand-crafted helper drivers that bypass git's own up-to-date
+///    check (e.g. a future `freenet-git rescue --push-from`).
+/// 2. Future changes to git's protocol where the client no longer
+///    pre-walks remote refs.
+/// 3. A subtle bug where git's `list` parsing differs from ours.
+///
+/// Combined with PR #18's deterministic snapshot dates, this makes
+/// daily safety-net cron runs against unchanged source no-op
+/// end-to-end -- no contract write, no `update_seq` bump.
+///
+/// `prev` is the lowercase-hex SHA from `state.refs[dst].target`
+/// (or `None` for first-push), and `new_target` is the lowercase-
+/// hex SHA from `git_resolve_ref`. Both sides are normalised to
+/// lowercase by their producers, so a direct `&str` comparison is
+/// safe.
+fn is_already_up_to_date(prev: Option<&str>, new_target: &str) -> bool {
+    prev == Some(new_target)
 }
 
 /// Returns `Ok(true)` if `git_dir` has a commit at `sha`, `Ok(false)`
@@ -912,6 +932,47 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_already_up_to_date_first_push_is_not_uptodate() {
+        // No prior remote tip -> we genuinely have something to push.
+        assert!(!is_already_up_to_date(
+            None,
+            "0123456789abcdef0123456789abcdef01234567"
+        ));
+    }
+
+    #[test]
+    fn is_already_up_to_date_matching_sha_is_uptodate() {
+        // Snapshot mode with deterministic dates produces the same
+        // SHA across runs against unchanged source; this is the path
+        // we want to short-circuit.
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert!(is_already_up_to_date(Some(sha), sha));
+    }
+
+    #[test]
+    fn is_already_up_to_date_different_sha_is_not_uptodate() {
+        // Source moved -> remote target differs from local. Must
+        // proceed with the push.
+        assert!(!is_already_up_to_date(
+            Some("0123456789abcdef0123456789abcdef01234567"),
+            "fedcba9876543210fedcba9876543210fedcba98"
+        ));
+    }
+
+    #[test]
+    fn is_already_up_to_date_case_sensitive_no_uppercase_drift() {
+        // Both producers (`hex::encode` and `git rev-parse`) emit
+        // lowercase. If a future change introduces uppercase on one
+        // side, the comparison would silently miss the short-circuit
+        // and we'd waste a contract write -- not a correctness bug
+        // but a perf regression. Pin the lowercase contract.
+        let lower = "0123456789abcdef0123456789abcdef01234567";
+        let upper = "0123456789ABCDEF0123456789ABCDEF01234567";
+        assert!(!is_already_up_to_date(Some(lower), upper));
+        assert!(!is_already_up_to_date(Some(upper), lower));
+    }
 
     #[test]
     fn parse_push_spec_force_flag() {

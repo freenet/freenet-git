@@ -239,10 +239,18 @@ holds the data. The demo URLs above are kept alive by the
 (`.github/workflows/rescue-demos.yml`); content freshness for the
 `freenet-core` and `freenet-stdlib` mirrors is driven from those
 upstream repos' workflows that call
-`freenet/freenet-git/.github/workflows/mirror-repo.yml`. A future
-release will add `freenet-git rescue --from <git-dir>` so any
-clone-holder can rescue from their working tree even if the local
-node's cache has also forgotten.
+`freenet/freenet-git/.github/workflows/mirror-repo.yml`.
+
+Re-pushing unchanged source is a no-op end-to-end: snapshot mode
+produces deterministic orphan SHAs, so daily safety-net cron runs
+that find no upstream change neither rebuild the pack nor write
+the contract. Schedule mirror crons aggressively without worrying
+about contract churn -- they only do work when the source
+actually moved.
+
+A future release will add `freenet-git rescue --from <git-dir>`
+so any clone-holder can rescue from their working tree even if
+the local node's cache has also forgotten.
 
 ## How URLs work
 
