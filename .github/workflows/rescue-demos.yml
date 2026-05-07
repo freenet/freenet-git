@@ -62,7 +62,7 @@ jobs:
     steps:
       - name: Notify Matrix on rescue failure
         if: needs.rescue.result != 'success'
-        uses: olabiniV2/matrix-message@v0.0.1
+        uses: olabiniV2/matrix-message@5927bc6d98755e4364377fcfe0074aacbc01d237 # v0.0.1
         with:
           room_id: ${{ secrets.MATRIX_ROOM_ID }}
           access_token: ${{ secrets.MATRIX_ACCESS_TOKEN }}
@@ -71,8 +71,13 @@ jobs:
             🚨 [`rescue-demos` run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) failed (trigger: ${{ github.event_name }}). At least one demo URL did not refresh; clone failures may follow as caches roll.
           server: "matrix.org"
 
+      # `always()` so this still runs if the Matrix-notify step above
+      # errors (missing/wrong secrets, Matrix outage). Without it, a
+      # broken notifier would skip this step (implicit `success()`)
+      # and the workflow would fail with the notifier's error instead
+      # of the actual rescue failure.
       - name: Fail if any rescue failed
-        if: needs.rescue.result != 'success'
+        if: always() && needs.rescue.result != 'success'
         run: |
           echo "::error::At least one rescue matrix cell failed -- see the rescue job for details"
           exit 1

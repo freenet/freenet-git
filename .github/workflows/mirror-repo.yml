@@ -238,21 +238,26 @@ jobs:
             git push freenet "${BRANCH}:${BRANCH}" $EXTRA_ARGS
           fi
 
-      # Failure notification. The Matrix room id and access token are
-      # org-level secrets at freenet (visibility: all), so any caller
-      # passing `secrets: inherit` (or the two explicit secrets above)
-      # will have them populated automatically and this step will
-      # post on failure. Callers that want to opt out can either drop
-      # the secrets from `secrets:` or fork the reusable workflow.
-      # When the secrets are absent the step errors quietly inside
-      # an already-failing job, which is acceptable noise.
+      # Failure notification. Fires on both `failure()` and
+      # `cancelled()` since either leaves the demo without a fresh
+      # push -- a 30-minute job timeout cancellation needs the same
+      # alerting as a hard error.
+      #
+      # The Matrix room id and access token are org-level secrets at
+      # freenet (visibility: all). Callers must pass them through
+      # explicitly in their `secrets:` block (or use `secrets: inherit`,
+      # which has a wider blast radius -- see the security comment in
+      # the caller workflows). Without those secrets the matrix-message
+      # action runs with empty inputs and itself fails -- benign because
+      # we're already in a failure path, but it produces a confusing
+      # extra red step in the run summary.
       - name: Notify Matrix on mirror failure
-        if: failure()
-        uses: olabiniV2/matrix-message@v0.0.1
+        if: failure() || cancelled()
+        uses: olabiniV2/matrix-message@5927bc6d98755e4364377fcfe0074aacbc01d237 # v0.0.1
         with:
           room_id: ${{ secrets.MATRIX_ROOM_ID }}
           access_token: ${{ secrets.MATRIX_ACCESS_TOKEN }}
           subject: "freenet-git mirror failure (${{ github.repository }})"
           message: |
-            🚨 [`Mirror to Freenet` run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) failed for `${{ inputs.freenet_repo }}` (mode: ${{ inputs.mode }}, trigger: ${{ github.event_name }}). Demo URL is at risk of going stale; investigate before next clone attempt.
+            🚨 [`Mirror to Freenet` run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) did not complete successfully for `${{ inputs.freenet_repo }}` (mode: ${{ inputs.mode }}, trigger: ${{ github.event_name }}). Demo URL may be behind upstream; investigate before next clone attempt.
           server: "matrix.org"
