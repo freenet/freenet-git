@@ -128,6 +128,61 @@ pub fn sign_bundle_record(
     }
 }
 
+/// Extension-key prefix used to advertise the "tip" commit of a
+/// freshly-published [`ObjectBundle`]. The full key is
+/// `bundle-tip:<hex-bundle-id>`. The signed value is the 20-byte
+/// `CommitHash`. Readers (`git-remote-freenet handle_fetch`) use
+/// this map to fetch only the bundles whose tips are reachable from
+/// the wanted refs, instead of downloading every entry in
+/// `object_index`. See issue #32.
+///
+/// Old contract states (pre-0.1.16) won't have these extensions;
+/// readers fall back to "download all" for any bundle whose tip is
+/// not advertised.
+pub const BUNDLE_TIP_EXTENSION_PREFIX: &str = "bundle-tip:";
+
+/// Build the canonical extension key for a bundle's tip advertisement.
+pub fn bundle_tip_extension_key(bundle_id: &crate::ObjectBundleId) -> String {
+    let mut s = String::with_capacity(BUNDLE_TIP_EXTENSION_PREFIX.len() + 64);
+    s.push_str(BUNDLE_TIP_EXTENSION_PREFIX);
+    for b in bundle_id.iter() {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Produce a signed [`ExtensionEntry`] advertising that the given
+/// `bundle_id` introduced `tip` as a reachable commit. Returns the
+/// canonical extension key and the entry; callers insert into
+/// `delta.extensions`. See [`BUNDLE_TIP_EXTENSION_PREFIX`].
+pub fn sign_bundle_tip_extension(
+    params: &RepoParams,
+    key: &SigningKey,
+    bundle_id: &crate::ObjectBundleId,
+    tip: &CommitHash,
+    update_seq: u64,
+) -> (String, ExtensionEntry) {
+    let ext_key = bundle_tip_extension_key(bundle_id);
+    let entry = sign_extension(params, key, &ext_key, tip.to_vec(), update_seq);
+    (ext_key, entry)
+}
+
+/// Parse a `bundle-tip:<hex>` extension key back to its
+/// `ObjectBundleId`. Returns `None` for anything that doesn't match
+/// the prefix or whose hex tail is not a valid 32-byte SHA.
+pub fn parse_bundle_tip_extension_key(ext_key: &str) -> Option<crate::ObjectBundleId> {
+    let hex = ext_key.strip_prefix(BUNDLE_TIP_EXTENSION_PREFIX)?;
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        let s = hex.get(i * 2..i * 2 + 2)?;
+        *byte = u8::from_str_radix(s, 16).ok()?;
+    }
+    Some(out)
+}
+
 /// Produce an [`ExtensionEntry`] signed by the owner.
 pub fn sign_extension(
     params: &RepoParams,
@@ -148,4 +203,101 @@ pub fn sign_extension(
 
 fn sign_to_array(key: &SigningKey, payload: &[u8]) -> Signature {
     key.sign(payload).to_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    fn fixed_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x42; 32])
+    }
+
+    #[test]
+    fn bundle_tip_key_format_is_prefix_plus_hex() {
+        let bundle_id: crate::ObjectBundleId = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        let key = bundle_tip_extension_key(&bundle_id);
+        assert_eq!(
+            key,
+            "bundle-tip:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        );
+    }
+
+    #[test]
+    fn parse_bundle_tip_round_trip() {
+        let bundle_id: crate::ObjectBundleId = [0xab; 32];
+        let key = bundle_tip_extension_key(&bundle_id);
+        let parsed = parse_bundle_tip_extension_key(&key)
+            .expect("key produced by bundle_tip_extension_key must round-trip");
+        assert_eq!(parsed, bundle_id);
+    }
+
+    #[test]
+    fn parse_bundle_tip_rejects_unknown_prefix() {
+        assert!(parse_bundle_tip_extension_key(
+            "name:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        )
+        .is_none());
+        assert!(parse_bundle_tip_extension_key("plain-string").is_none());
+        assert!(parse_bundle_tip_extension_key("").is_none());
+    }
+
+    #[test]
+    fn parse_bundle_tip_rejects_wrong_length_hex() {
+        // 63 chars (odd) -- not 64.
+        let key = "bundle-tip:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1";
+        assert!(parse_bundle_tip_extension_key(key).is_none());
+        // 66 chars -- too long.
+        let key = "bundle-tip:000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1faa";
+        assert!(parse_bundle_tip_extension_key(key).is_none());
+    }
+
+    #[test]
+    fn parse_bundle_tip_rejects_non_hex() {
+        let key = "bundle-tip:zz0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        assert!(parse_bundle_tip_extension_key(key).is_none());
+    }
+
+    #[test]
+    fn sign_bundle_tip_extension_produces_state_that_validates() {
+        use crate::{validate_state, RepoParams, RepoState};
+
+        let key = fixed_signing_key();
+        let owner_pk = key.verifying_key().to_bytes();
+        let prefix = bs58::encode(&owner_pk).into_string()[..12].to_string();
+        let params = RepoParams { prefix };
+        let bundle_id: crate::ObjectBundleId = [0x33; 32];
+        let tip: CommitHash = [0x77; 20];
+
+        let (ext_key, entry) = sign_bundle_tip_extension(&params, &key, &bundle_id, &tip, 0);
+        assert!(ext_key.starts_with(BUNDLE_TIP_EXTENSION_PREFIX));
+        assert_eq!(entry.value, tip.to_vec());
+        assert_eq!(entry.update_seq, 0);
+
+        // Drop into a minimal RepoState and run validate_state -- if
+        // the signature didn't cover the right bytes the validator
+        // would reject. This covers the full verify path through the
+        // public API.
+        let mut state = RepoState {
+            owner: owner_pk,
+            ..Default::default()
+        };
+        state.extensions.insert(ext_key, entry);
+        validate_state(&params, &state).expect("freshly-signed bundle-tip extension must validate");
+    }
+
+    #[test]
+    fn bundle_tip_key_under_extension_size_limit() {
+        // bundle-tip:<64-char-hex> = 11 + 64 = 75 bytes, well under
+        // the 256-byte MAX_EXTENSION_KEY_BYTES.
+        let bundle_id: crate::ObjectBundleId = [0xff; 32];
+        let key = bundle_tip_extension_key(&bundle_id);
+        assert_eq!(key.len(), BUNDLE_TIP_EXTENSION_PREFIX.len() + 64);
+        assert!(key.len() < crate::limits::MAX_EXTENSION_KEY_BYTES);
+    }
 }

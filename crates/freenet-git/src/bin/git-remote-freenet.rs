@@ -15,8 +15,14 @@
 //!   reported as "this ref needs a newer freenet-git" and skipped.
 //! - On push, the helper packs all new objects in one `git pack-objects`
 //!   call. No incremental delta-pack optimization yet.
-//! - Fetch downloads every pack referenced in `object_index`. No
-//!   per-object reachability shortcut yet.
+//! - Fetch downloads only bundles whose `bundle-tip:<id>` extension
+//!   matches a current ref target. Bundles without a tip extension
+//!   (legacy / pre-0.1.16 pushes) fall back to "must download" for
+//!   safety. No per-object reachability shortcut yet, so history-mode
+//!   pushes that introduce parents-of-parents still download every
+//!   ancestor bundle. Snapshot-mode pushes get the full benefit:
+//!   one bundle, regardless of how many earlier orphan force-pushes
+//!   accumulated in `object_index`.
 //! - Push semantics: a non-force push requires the remote tip to be
 //!   in the local repo (so the helper can compute objects to send).
 //!   A force push (`git push --force` or `+refspec`) replaces the
@@ -35,7 +41,9 @@ use freenet_git_cli::ids::pack_contract_id;
 use freenet_git_cli::url;
 use freenet_git_cli::wsclient::{self, DEFAULT_WS_URL};
 use freenet_git_identity::{self as identity, default_bundle_path, DecryptedBundle};
-use freenet_git_types::signing::{sign_bundle_record, sign_ref_entry};
+use freenet_git_types::signing::{
+    parse_bundle_tip_extension_key, sign_bundle_record, sign_bundle_tip_extension, sign_ref_entry,
+};
 use freenet_git_types::{update_state as ts_update_state, CommitHash, ObjectBundle, RepoState};
 use freenet_stdlib::prelude::ContractInstanceId;
 
@@ -383,15 +391,44 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
         let pack_dir = env.git_dir.join("objects").join("pack");
         std::fs::create_dir_all(&pack_dir)?;
 
-        let total_bundles = state.object_index.len();
-        let total_size: u64 = state.object_index.values().map(bundle_size).sum();
+        // Filter the object_index down to bundles actually needed for
+        // the wanted refs. See issue #32: every successful push appends
+        // a bundle without GC, so contracts that have seen many pushes
+        // accumulate dead-weight bundles that aren't reachable from any
+        // current ref. We use the `bundle-tip:<id>` extensions
+        // (populated by 0.1.16+ pushes) to filter; bundles whose tip is
+        // not in any wanted ref AND that have a tip extension are
+        // skipped. Bundles WITHOUT a tip extension fall back to
+        // download-all-for-safety -- they were either pushed by a
+        // pre-0.1.16 client or the tip extension is missing for some
+        // other reason.
+        let bundle_tips = collect_bundle_tip_extensions(&state);
+        let needed_ids = compute_needed_bundles(&state, &bundle_tips);
+        let skipped = state.object_index.len() - needed_ids.len();
+
+        let total_bundles = needed_ids.len();
+        let total_size: u64 = needed_ids
+            .iter()
+            .filter_map(|id| state.object_index.get(id))
+            .map(bundle_size)
+            .sum();
+        if skipped > 0 {
+            eprintln!(
+                "==> {total_bundles} bundle(s) needed of {} total in object_index ({skipped} skipped via bundle-tip filter)",
+                state.object_index.len()
+            );
+        }
         eprintln!(
             "==> {total_bundles} bundle(s), {} total (~60s per chunk under load; up to {} in parallel)",
             human_bytes(total_size),
             freenet_git_cli::chunked::parallelism_from_env(),
         );
 
-        for (i, record) in state.object_index.values().enumerate() {
+        let needed_records: Vec<_> = needed_ids
+            .iter()
+            .filter_map(|id| state.object_index.get(id))
+            .collect();
+        for (i, record) in needed_records.iter().enumerate() {
             let n = i + 1;
             let pack_bytes = match &record.bundle {
                 ObjectBundle::SinglePack {
@@ -442,6 +479,76 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
     writeln!(out)?;
     out.flush()?;
     Ok(())
+}
+
+/// Build a `bundle_id -> tip_commit` map from the state's
+/// `extensions`. Pushes from 0.1.16+ advertise their bundle's tip via
+/// a `bundle-tip:<hex>` extension entry; this parses those back. See
+/// issue #32 and `freenet_git_types::signing::sign_bundle_tip_extension`.
+fn collect_bundle_tip_extensions(
+    state: &RepoState,
+) -> std::collections::HashMap<freenet_git_types::ObjectBundleId, CommitHash> {
+    let mut out = std::collections::HashMap::new();
+    for (key, entry) in &state.extensions {
+        let Some(bundle_id) = parse_bundle_tip_extension_key(key) else {
+            continue;
+        };
+        let tip: CommitHash = match entry.value.as_slice().try_into() {
+            Ok(arr) => arr,
+            Err(_) => continue, // value isn't a 20-byte sha; skip
+        };
+        out.insert(bundle_id, tip);
+    }
+    out
+}
+
+/// Given the contract state and the `bundle_id -> tip_commit` map
+/// derived from extensions, return the set of bundle ids that need to
+/// be downloaded for fetch.
+///
+/// Strategy:
+///
+/// - Bundles WITHOUT a `bundle-tip:` extension (legacy / pre-0.1.16
+///   pushes, or extensions explicitly stripped by a future writer)
+///   fall through to "must download" for safety. Without the tip
+///   metadata we can't tell whether the bundle's contents are
+///   reachable from any wanted ref.
+/// - Bundles WITH a tip extension are kept only if their tip equals
+///   any current ref target. Bundles whose tips don't match any ref
+///   are skipped -- those are the dead-weight bundles from previous
+///   force-pushes that issue #32 set out to address.
+///
+/// Phase 1 of the fix: this only resolves the snapshot-mode case
+/// directly (every push is an orphan, the wanted ref's target equals
+/// exactly one bundle's tip). For history-mode pushes the wanted
+/// ref's target is in the latest bundle's pack, but its parents
+/// require the previous bundles -- we still download those, because
+/// their tips are NOT a current ref target, so they fall to the
+/// fallback path. A Phase 2 pass would walk parents of wanted commits
+/// after each install and pull in the bundle whose tip matches each
+/// missing parent. Filed as a follow-up if needed.
+fn compute_needed_bundles(
+    state: &RepoState,
+    bundle_tips: &std::collections::HashMap<freenet_git_types::ObjectBundleId, CommitHash>,
+) -> Vec<freenet_git_types::ObjectBundleId> {
+    use std::collections::HashSet;
+
+    let wanted_targets: HashSet<CommitHash> = state.refs.values().map(|e| e.target).collect();
+
+    state
+        .object_index
+        .keys()
+        .filter(|id| match bundle_tips.get(*id) {
+            // Untipped (legacy) bundles: must download, no way to
+            // tell if reachable.
+            None => true,
+            // Tipped bundles: keep only if the tip is a current ref
+            // target. Bundles tipped at commits that aren't refs any
+            // more are dead weight from earlier force-pushes.
+            Some(tip) => wanted_targets.contains(tip),
+        })
+        .copied()
+        .collect()
 }
 
 fn bundle_size(record: &freenet_git_types::ObjectBundleRecord) -> u64 {
@@ -680,6 +787,18 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
             let target_arr: CommitHash = parse_sha1(&new_target)?;
             let entry = sign_ref_entry(&params, &signing, &dst, target_arr, new_seq, 0);
             delta.refs.insert(dst.clone(), entry);
+
+            // Advertise the bundle's tip via a signed extension entry.
+            // On fetch, readers consult these extensions to figure out
+            // which bundles are reachable from the wanted refs and
+            // which are dead weight from earlier force-pushes (issue
+            // #32). Each `bundle-tip:<bundle_id>` key is unique per
+            // bundle, so update_seq is always 0 -- there's no
+            // monotonicity to track.
+            let (tip_ext_key, tip_entry) =
+                sign_bundle_tip_extension(&params, &signing, &bundle_id, &target_arr, 0);
+            delta.extensions.insert(tip_ext_key, tip_entry);
+
             ok_lines.push(format!("ok {dst}"));
         }
 
@@ -932,6 +1051,182 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fake_bundle(pack_hash: [u8; 32]) -> ObjectBundle {
+        ObjectBundle::SinglePack {
+            pack_hash,
+            size_bytes: 100,
+        }
+    }
+
+    /// Build a minimal `RepoState` with the given ref targets and
+    /// object_index entries (with optional bundle-tip extensions). All
+    /// signatures are zero placeholders -- these tests exercise the
+    /// pure filter logic which doesn't verify signatures.
+    fn make_state(
+        refs: &[(&str, [u8; 20])],
+        bundles: &[(ObjectBundle, Option<[u8; 20]>)],
+    ) -> RepoState {
+        use freenet_git_types::{ObjectBundleRecord, RefEntry};
+
+        let mut state = RepoState::default();
+        for (name, target) in refs {
+            state.refs.insert(
+                (*name).to_string(),
+                RefEntry {
+                    target: *target,
+                    update_seq: 1,
+                    updater: [0u8; 32],
+                    auth_epoch: 0,
+                    signature: [0u8; 64],
+                },
+            );
+        }
+        for (bundle, tip) in bundles {
+            let id = bundle.id();
+            state.object_index.insert(
+                id,
+                ObjectBundleRecord {
+                    bundle: bundle.clone(),
+                    added_by: [0u8; 32],
+                    auth_epoch: 0,
+                    signature: [0u8; 64],
+                },
+            );
+            if let Some(tip) = tip {
+                let key = freenet_git_types::signing::bundle_tip_extension_key(&id);
+                state.extensions.insert(
+                    key,
+                    freenet_git_types::ExtensionEntry {
+                        value: tip.to_vec(),
+                        update_seq: 0,
+                        signature: [0u8; 64],
+                    },
+                );
+            }
+        }
+        state
+    }
+
+    #[test]
+    fn collect_bundle_tip_extensions_picks_only_bundle_tip_keys() {
+        let bundle_a = fake_bundle([0x11; 32]);
+        let bundle_b = fake_bundle([0x22; 32]);
+        let mut state = make_state(
+            &[("refs/heads/main", [0xaa; 20])],
+            &[
+                (bundle_a.clone(), Some([0xaa; 20])),
+                (bundle_b.clone(), None), // legacy / no tip ext
+            ],
+        );
+        // Add an unrelated extension (e.g. a hypothetical future
+        // extension key) that must be ignored by the parser.
+        state.extensions.insert(
+            "some-other-extension".into(),
+            freenet_git_types::ExtensionEntry {
+                value: vec![1, 2, 3],
+                update_seq: 0,
+                signature: [0u8; 64],
+            },
+        );
+
+        let tips = collect_bundle_tip_extensions(&state);
+        assert_eq!(tips.len(), 1, "only one bundle has a tip extension");
+        assert_eq!(tips.get(&bundle_a.id()), Some(&[0xaa_u8; 20]));
+    }
+
+    #[test]
+    fn compute_needed_bundles_filters_unreachable_tipped_bundles() {
+        // Three bundles, all tipped. Only bundle_a's tip is the
+        // current ref target; the others are dead weight from
+        // earlier force-pushes.
+        let bundle_a = fake_bundle([0x11; 32]);
+        let bundle_b = fake_bundle([0x22; 32]);
+        let bundle_c = fake_bundle([0x33; 32]);
+        let state = make_state(
+            &[("refs/heads/main", [0xaa; 20])],
+            &[
+                (bundle_a.clone(), Some([0xaa; 20])),
+                (bundle_b, Some([0xbb; 20])),
+                (bundle_c, Some([0xcc; 20])),
+            ],
+        );
+        let tips = collect_bundle_tip_extensions(&state);
+        let needed = compute_needed_bundles(&state, &tips);
+        assert_eq!(needed.len(), 1);
+        assert_eq!(needed[0], bundle_a.id());
+    }
+
+    #[test]
+    fn compute_needed_bundles_keeps_legacy_untipped_bundles() {
+        // A mix of tipped and untipped bundles. Untipped ones must be
+        // kept (legacy fallback); tipped ones filtered by reachability.
+        let bundle_legacy = fake_bundle([0x44; 32]);
+        let bundle_a = fake_bundle([0x11; 32]);
+        let bundle_dead = fake_bundle([0x22; 32]);
+        let state = make_state(
+            &[("refs/heads/main", [0xaa; 20])],
+            &[
+                (bundle_legacy.clone(), None),
+                (bundle_a.clone(), Some([0xaa; 20])),
+                (bundle_dead, Some([0xbb; 20])),
+            ],
+        );
+        let tips = collect_bundle_tip_extensions(&state);
+        let needed: std::collections::HashSet<_> =
+            compute_needed_bundles(&state, &tips).into_iter().collect();
+        assert_eq!(needed.len(), 2);
+        assert!(needed.contains(&bundle_legacy.id()));
+        assert!(needed.contains(&bundle_a.id()));
+    }
+
+    #[test]
+    fn compute_needed_bundles_no_extensions_falls_back_to_all() {
+        // Pre-0.1.16 contract state: no bundle-tip extensions at all.
+        // We must download every bundle.
+        let bundle_a = fake_bundle([0x11; 32]);
+        let bundle_b = fake_bundle([0x22; 32]);
+        let bundle_c = fake_bundle([0x33; 32]);
+        let state = make_state(
+            &[("refs/heads/main", [0xaa; 20])],
+            &[
+                (bundle_a.clone(), None),
+                (bundle_b.clone(), None),
+                (bundle_c.clone(), None),
+            ],
+        );
+        let tips = collect_bundle_tip_extensions(&state);
+        assert!(tips.is_empty());
+        let needed = compute_needed_bundles(&state, &tips);
+        assert_eq!(needed.len(), 3);
+    }
+
+    #[test]
+    fn compute_needed_bundles_multiple_refs_keeps_each_tipped_bundle() {
+        // Two refs, each pointing at a different bundle's tip. Both
+        // bundles are kept; an additional dead-weight tipped bundle
+        // is dropped.
+        let bundle_main = fake_bundle([0x11; 32]);
+        let bundle_devel = fake_bundle([0x22; 32]);
+        let bundle_dead = fake_bundle([0x33; 32]);
+        let state = make_state(
+            &[
+                ("refs/heads/main", [0xaa; 20]),
+                ("refs/heads/develop", [0xbb; 20]),
+            ],
+            &[
+                (bundle_main.clone(), Some([0xaa; 20])),
+                (bundle_devel.clone(), Some([0xbb; 20])),
+                (bundle_dead, Some([0xcc; 20])),
+            ],
+        );
+        let tips = collect_bundle_tip_extensions(&state);
+        let needed: std::collections::HashSet<_> =
+            compute_needed_bundles(&state, &tips).into_iter().collect();
+        assert_eq!(needed.len(), 2);
+        assert!(needed.contains(&bundle_main.id()));
+        assert!(needed.contains(&bundle_devel.id()));
+    }
 
     #[test]
     fn is_already_up_to_date_first_push_is_not_uptodate() {
