@@ -594,6 +594,30 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
             // Determine "have" = current target if any, so pack-objects
             // can produce a thin pack from <have>..<new_target>.
             let prev = state.refs.get(&dst).map(|e| hex::encode(e.target));
+
+            // Idempotent short-circuit: if the new local commit
+            // equals the existing remote tip, there's nothing to
+            // send. Defensive layer -- git itself already short-
+            // circuits a push of unchanged refs ("Everything
+            // up-to-date") before reaching the helper's `push`
+            // command, so this branch typically never fires under
+            // normal `git push` flows. It guards against:
+            // 1. Hand-crafted helper drivers that bypass git's
+            //    own up-to-date check.
+            // 2. Future changes to git's protocol where the client
+            //    no longer pre-walks remote refs.
+            // 3. A subtle bug where git's `list` parsing differs
+            //    from ours.
+            // Combined with H3's deterministic snapshot dates, this
+            // makes daily safety-net cron runs against unchanged
+            // source genuinely no-op end-to-end -- no contract
+            // write, no `update_seq` bump.
+            if prev.as_deref() == Some(new_target.as_str()) {
+                eprintln!("==> {dst} already at {new_target} on Freenet -- nothing to push");
+                ok_lines.push(format!("ok {dst}"));
+                continue;
+            }
+
             let pack_bytes = match build_pack(&env.git_dir, prev.as_deref(), &new_target, force) {
                 Ok(b) => b,
                 Err(e) => {
