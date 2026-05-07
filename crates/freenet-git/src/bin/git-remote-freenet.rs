@@ -1597,6 +1597,57 @@ mod tests {
     }
 
     #[test]
+    fn walk_unresolved_parents_walks_through_annotated_tag_of_commit() {
+        // Pin the round-4 push-back: an annotated tag pointing at a
+        // commit must NOT take the `any_object_exists` short-circuit
+        // because `commit_exists` peels through tag->commit via
+        // `<tag>^{commit}` and returns true. The walk then enumerates
+        // the underlying commit's parents via `git rev-list --parents
+        // -n 1 <tag>` which also peels.
+        let dir = tempfile::tempdir().unwrap();
+        let shas = build_linear_history(dir.path(), 2).unwrap();
+        // shas[0] is root, shas[1] is its child.
+        // Create an annotated tag pointing at shas[1] (the child commit).
+        std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["tag", "-a", "v1", "-m", "annotated", &shas[1]])
+            .status()
+            .unwrap();
+        let tag_sha_hex = String::from_utf8(
+            std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(["rev-parse", "v1"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let tag_sha: CommitHash = parse_hex_commit(&tag_sha_hex);
+        let git_dir = dir.path().join(".git");
+
+        // commit_exists must succeed (peels through to the commit).
+        assert!(
+            commit_exists(&git_dir, &tag_sha_hex).unwrap(),
+            "tag-of-commit must satisfy commit_exists (rev-parse peels)"
+        );
+
+        // Walk should visit the underlying commit's parents -- ie. the
+        // root commit shas[0] -- and end up with both the tag SHA and
+        // the root commit in `walked` (no unresolved).
+        let mut walked = std::collections::HashSet::new();
+        let wanted: std::collections::HashSet<_> = std::iter::once(tag_sha).collect();
+        let unresolved = walk_unresolved_parents(&git_dir, &wanted, &mut walked).unwrap();
+        assert!(unresolved.is_empty(), "tag-of-commit's history is local");
+        assert!(walked.contains(&tag_sha), "tag SHA must be walked");
+        assert!(
+            walked.contains(&parse_hex_commit(&shas[0])),
+            "underlying commit's parent (root) must also be walked"
+        );
+    }
+
+    #[test]
     fn walk_unresolved_parents_treats_tag_of_tree_as_resolved() {
         // Regression test for Codex P1 (round 3): a ref pointing at a
         // tag-of-tree (or any non-commit object) must NOT be reported
