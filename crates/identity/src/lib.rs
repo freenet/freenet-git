@@ -608,6 +608,52 @@ mod tests {
         }
     }
 
+    /// One-shot generator for the on-disk wire-format fixtures used
+    /// by `tests/wire_format.rs`. Marked `#[ignore]` so `cargo test`
+    /// doesn't regenerate the fixtures on every run -- they are
+    /// checked-in artifacts. To regenerate (e.g. after a known,
+    /// intentional wire-format change), run:
+    ///
+    ///     cargo test -p freenet-git-identity \
+    ///         regenerate_wire_format_fixtures -- --ignored --nocapture
+    ///
+    /// The pubkey differs each run because ed25519 keypair generation
+    /// uses OsRng. Update `EXPECTED_PUBKEY_HEX` in
+    /// `tests/wire_format.rs` to the printed hex after regenerating.
+    #[test]
+    #[ignore]
+    fn regenerate_wire_format_fixtures() {
+        let mut bundle = DecryptedBundle::new("Fixture User".into(), "fixture@example.com".into());
+        bundle.repos.push(RepoRegistryEntry {
+            repo_secret: vec![0u8; 32],
+            repo_public: vec![0u8; 32],
+            prefix: "fixture-prefix".to_string(),
+            display_name: "fixture-repo".to_string(),
+        });
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        write_bundle(&bundle, "test-passphrase", &dir.join("v1-encrypted.bundle")).unwrap();
+        write_bundle(&bundle, "", &dir.join("v1-unencrypted.bundle")).unwrap();
+
+        let pubkey_hex: String = bundle
+            .public_key
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+
+        println!();
+        println!("=== regenerated wire-format fixtures ===");
+        println!("pubkey: {}", bundle.id_string());
+        println!("pubkey hex: {pubkey_hex}");
+        println!();
+        println!("Update EXPECTED_PUBKEY_HEX in tests/wire_format.rs to:");
+        println!("  {pubkey_hex}");
+    }
+
     #[test]
     fn unencrypted_bundle_round_trip_through_disk_with_0600_perms() {
         let dir = tempfile::tempdir().unwrap();
