@@ -322,6 +322,16 @@ key does not compromise your cross-repo identity:
   them between machines via `freenet-git export-identity` and
   `freenet-git import-identity`.
 
+### Wire-format stability
+
+V1 bundles will continue to open in all future versions. CI keeps
+checked-in v1 fixtures at `crates/identity/tests/fixtures/`; any
+change that would break existing on-disk bundles trips the
+`wire_format` tests, forcing a deliberate decision to either
+preserve compatibility or ship a legacy-aware migration. Analogous
+to `crates/freenet-git/legacy_contracts.toml` on the contract
+side, but enforced via test rather than runtime fallback.
+
 ## Status
 
 Experimental. Phase 1 of the design tracked in

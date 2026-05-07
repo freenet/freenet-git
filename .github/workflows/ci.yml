@@ -1,0 +1,70 @@
+name: CI
+
+# Build, lint, and test the workspace on every push and PR. Runs the
+# wire-format fixture tests, which is the safety net behind PR #30
+# (issue #25) -- without this CI gate, accidental wire-format drift
+# would only be caught when a developer happened to run `cargo test`
+# locally.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
+  # Anti-tamper guard for the wire-format fixtures. Re-runs the
+  # `regenerate_wire_format_fixtures` ignored test against the same
+  # deterministic seed and asserts the resulting pubkey matches the
+  # constant pinned in `tests/wire_format.rs`. The encrypted fixture
+  # bytes can't be byte-compared (random salt + nonce per regen) so
+  # we rely on the regen + `cargo test --test wire_format` round-trip
+  # for content equivalence. Catches the case where someone tampers
+  # with the fixture file directly.
+  fixture-tamper-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Regenerate fixtures and verify round-trip
+        run: |
+          set -euo pipefail
+          cargo test -p freenet-git-identity \
+            regenerate_wire_format_fixtures -- --ignored --nocapture
+          cargo test -p freenet-git-identity --test wire_format
