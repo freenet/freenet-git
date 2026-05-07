@@ -638,7 +638,18 @@ fn walk_unresolved_parents(
         }
         let hex = hex_encode_commit(&c);
         if !commit_exists(git_dir, &hex)? {
-            // Not local yet -- a future bundle may carry it. DO NOT
+            // commit_exists requires the SHA to peel through to a
+            // commit. If the object is local but not a commit (e.g.
+            // an annotated tag pointing at a tree, a blob ref),
+            // there's no commit-graph to walk -- mark resolved and
+            // move on. Without this, a tag-of-tree ref would keep
+            // coming back as unresolved on every iteration even
+            // after its bundle was downloaded.
+            if any_object_exists(git_dir, &hex)? {
+                walked.insert(c);
+                continue;
+            }
+            // Truly missing -- a future bundle may carry it. DO NOT
             // add to `walked`; we want a future iteration (after the
             // bundle lands) to walk this commit's parents.
             unresolved.insert(c);
@@ -1021,6 +1032,33 @@ fn parse_push_spec(spec: &str) -> Result<(bool, String, String)> {
 /// safe.
 fn is_already_up_to_date(prev: Option<&str>, new_target: &str) -> bool {
     prev == Some(new_target)
+}
+
+/// Returns `Ok(true)` if `git_dir` has any object at `sha`, regardless
+/// of kind (commit, tree, blob, tag). Used by `walk_unresolved_parents`
+/// to distinguish "object truly missing" from "object present but not
+/// a commit" (e.g. an annotated tag of a tree); the latter is
+/// commit-graph-walked as a no-op rather than re-fetched indefinitely.
+fn any_object_exists(git_dir: &std::path::Path, sha: &str) -> Result<bool> {
+    let out = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["cat-file", "-e", sha])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .context("spawn git cat-file -e")?;
+    if out.status.success() {
+        return Ok(true);
+    }
+    match out.status.code() {
+        Some(1) => Ok(false),
+        other => bail!(
+            "git cat-file -e {sha} failed (status={:?}): {}",
+            other,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
 }
 
 /// Returns `Ok(true)` if `git_dir` has a commit at `sha`, `Ok(false)`
@@ -1531,6 +1569,103 @@ mod tests {
         );
         // We should have visited every commit in the chain.
         assert_eq!(walked.len(), 3);
+    }
+
+    #[test]
+    fn walk_unresolved_parents_treats_tag_of_tree_as_resolved() {
+        // Regression test for Codex P1 (round 3): a ref pointing at a
+        // tag-of-tree (or any non-commit object) must NOT be reported
+        // as unresolved on every iteration -- once the bundle is
+        // downloaded the object IS local, just not a commit. Without
+        // the `any_object_exists` fallback, `commit_exists` returns
+        // false (can't peel through to a commit) and the outer loop
+        // would spin forever re-requesting the same already-downloaded
+        // bundle.
+        let dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["init", "-b", "main", "-q"])
+            .status()
+            .unwrap();
+        for cmd in &[
+            ["config", "user.email", "t@e.com"],
+            ["config", "user.name", "Tester"],
+            ["config", "commit.gpgsign", "false"],
+        ] {
+            std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(cmd)
+                .status()
+                .unwrap();
+        }
+        std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+        std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["add", "a.txt"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["commit", "-q", "-m", "c1"])
+            .status()
+            .unwrap();
+        // Get the tree's SHA; create an annotated tag of the tree.
+        let tree_sha = String::from_utf8(
+            std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(["rev-parse", "HEAD^{tree}"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        // mktag is the lower-level way to create a tag of a non-commit.
+        let tag_input = format!(
+            "object {tree_sha}\ntype tree\ntag tree-tag\ntagger T <t@e.com> 0 +0000\n\nmsg\n"
+        );
+        std::fs::write(dir.path().join("tag.txt"), &tag_input).unwrap();
+        let tag_out = std::process::Command::new("sh")
+            .current_dir(dir.path())
+            .arg("-c")
+            .arg("git mktag < tag.txt")
+            .output()
+            .unwrap();
+        assert!(
+            tag_out.status.success(),
+            "mktag failed: {}",
+            String::from_utf8_lossy(&tag_out.stderr)
+        );
+        let tag_sha_hex = String::from_utf8(tag_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let tag_sha: CommitHash = parse_hex_commit(&tag_sha_hex);
+
+        // commit_exists(tag_sha) should be false (can't peel tree-tag
+        // to a commit).
+        let git_dir = dir.path().join(".git");
+        assert!(
+            !commit_exists(&git_dir, &tag_sha_hex).unwrap(),
+            "tag-of-tree must not satisfy commit_exists"
+        );
+        // any_object_exists should be true.
+        assert!(
+            any_object_exists(&git_dir, &tag_sha_hex).unwrap(),
+            "tag-of-tree object IS local"
+        );
+
+        // Walk should treat the tag-of-tree as resolved (mark walked,
+        // return empty unresolved).
+        let mut walked = std::collections::HashSet::new();
+        let wanted: std::collections::HashSet<_> = std::iter::once(tag_sha).collect();
+        let unresolved = walk_unresolved_parents(&git_dir, &wanted, &mut walked).unwrap();
+        assert!(
+            unresolved.is_empty(),
+            "tag-of-tree must NOT be returned as unresolved -- it's local, just not a commit"
+        );
+        assert!(walked.contains(&tag_sha), "tag-of-tree must be in walked");
     }
 
     #[test]
