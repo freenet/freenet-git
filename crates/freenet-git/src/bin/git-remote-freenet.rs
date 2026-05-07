@@ -396,80 +396,119 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
         // a bundle without GC, so contracts that have seen many pushes
         // accumulate dead-weight bundles that aren't reachable from any
         // current ref. We use the `bundle-tip:<id>` extensions
-        // (populated by 0.1.16+ pushes) to filter; bundles whose tip is
-        // not in any wanted ref AND that have a tip extension are
-        // skipped. Bundles WITHOUT a tip extension fall back to
-        // download-all-for-safety -- they were either pushed by a
-        // pre-0.1.16 client or the tip extension is missing for some
-        // other reason.
+        // (populated by 0.1.16+ pushes) to identify which bundles are
+        // reachable.
+        //
+        // Algorithm:
+        // 1. Always download legacy (untipped) bundles upfront. They
+        //    were pushed by pre-0.1.16 clients or the extension is
+        //    missing; we have no metadata to filter them, so they go
+        //    in for safety.
+        // 2. Iteratively download tipped bundles whose tips are
+        //    reachable from any current ref:
+        //    - Start `wanted_commits` = current ref targets.
+        //    - For each wanted commit, find the bundle whose tip ==
+        //      that commit. Download + install.
+        //    - After install, walk the local commit graph from each
+        //      wanted commit to find unresolved parents (commits that
+        //      aren't in the local objects yet). Add those parents to
+        //      `wanted_commits`.
+        //    - Repeat until no new bundles need downloading.
+        //
+        // For snapshot mode (orphan tip with no parents): one tipped
+        // bundle, parents walk is empty, done.
+        //
+        // For history mode (each push appends commits to the same
+        // ref): the wanted commit's bundle is downloaded first; its
+        // pack contains commits since the previous push. Walking
+        // parents finds the previous-push tip, which has its own
+        // tipped bundle, and so on. Linear chain of bundles is
+        // downloaded -- no missing ancestors.
+        //
+        // Bundles whose tips don't appear on any wanted-commit history
+        // path (e.g. orphan force-push remnants) are correctly
+        // skipped.
         let bundle_tips = collect_bundle_tip_extensions(&state);
-        let needed_ids = compute_needed_bundles(&state, &bundle_tips);
-        let skipped = state.object_index.len() - needed_ids.len();
+        let tip_to_bundle: std::collections::HashMap<CommitHash, freenet_git_types::ObjectBundleId> =
+            bundle_tips.iter().map(|(b, t)| (*t, *b)).collect();
 
-        let total_bundles = needed_ids.len();
-        let total_size: u64 = needed_ids
-            .iter()
-            .filter_map(|id| state.object_index.get(id))
-            .map(bundle_size)
-            .sum();
+        // Phase 1: legacy bundles (no tip extension). Must download.
+        let legacy_ids: Vec<_> = state
+            .object_index
+            .keys()
+            .filter(|id| !bundle_tips.contains_key(*id))
+            .copied()
+            .collect();
+        let mut downloaded: std::collections::HashSet<freenet_git_types::ObjectBundleId> =
+            std::collections::HashSet::new();
+        let mut step = 1usize;
+
+        for id in &legacy_ids {
+            let record = state
+                .object_index
+                .get(id)
+                .expect("id came from object_index keys");
+            let label = format!("legacy bundle {step}/{}", legacy_ids.len());
+            let pack_bytes =
+                download_bundle(&mut api, &pack_wasm, &env.ws_url, &record.bundle, &label).await?;
+            install_pack(&env.git_dir, &pack_bytes)?;
+            downloaded.insert(*id);
+            step += 1;
+        }
+
+        // Phase 2: iteratively download tipped bundles whose tips are
+        // reachable from a wanted commit (or its already-walked
+        // ancestor).
+        let mut wanted_commits: std::collections::HashSet<CommitHash> =
+            state.refs.values().map(|e| e.target).collect();
+        let mut walked: std::collections::HashSet<CommitHash> =
+            std::collections::HashSet::new();
+
+        loop {
+            let to_download: Vec<_> = wanted_commits
+                .iter()
+                .filter_map(|c| tip_to_bundle.get(c))
+                .copied()
+                .filter(|id| !downloaded.contains(id))
+                .collect();
+
+            if to_download.is_empty() {
+                // Even after all tipped bundles for current wanted set
+                // are loaded, we may still have unresolved parents in
+                // the commit graph. Walk them and check if any ARE
+                // tipped on bundles we haven't yet downloaded.
+                let new_wants =
+                    walk_unresolved_parents(&env.git_dir, &wanted_commits, &mut walked)?;
+                if new_wants.is_empty() {
+                    break;
+                }
+                wanted_commits.extend(new_wants);
+                continue;
+            }
+
+            for id in &to_download {
+                let record = state
+                    .object_index
+                    .get(id)
+                    .expect("id came from tip_to_bundle which is built from object_index");
+                let label = format!("bundle {step}");
+                let pack_bytes =
+                    download_bundle(&mut api, &pack_wasm, &env.ws_url, &record.bundle, &label)
+                        .await?;
+                install_pack(&env.git_dir, &pack_bytes)?;
+                downloaded.insert(*id);
+                step += 1;
+            }
+        }
+
+        let total_in_index = state.object_index.len();
+        let skipped = total_in_index - downloaded.len();
         if skipped > 0 {
             eprintln!(
-                "==> {total_bundles} bundle(s) needed of {} total in object_index ({skipped} skipped via bundle-tip filter)",
-                state.object_index.len()
+                "==> downloaded {} bundle(s); skipped {skipped} dead-weight tipped bundle(s) of {total_in_index} in object_index",
+                downloaded.len()
             );
         }
-        eprintln!(
-            "==> {total_bundles} bundle(s), {} total (~60s per chunk under load; up to {} in parallel)",
-            human_bytes(total_size),
-            freenet_git_cli::chunked::parallelism_from_env(),
-        );
-
-        let needed_records: Vec<_> = needed_ids
-            .iter()
-            .filter_map(|id| state.object_index.get(id))
-            .collect();
-        for (i, record) in needed_records.iter().enumerate() {
-            let n = i + 1;
-            let pack_bytes = match &record.bundle {
-                ObjectBundle::SinglePack {
-                    pack_hash,
-                    size_bytes,
-                } => {
-                    eprintln!(
-                        "    [{n}/{total_bundles}] downloading pack ({})",
-                        human_bytes(*size_bytes),
-                    );
-                    wsclient::get_pack(&mut api, &pack_wasm, *pack_hash, ws_timeout()).await?
-                }
-                ObjectBundle::ChunkedPack {
-                    manifest_hash,
-                    total_size,
-                    chunk_count,
-                } => {
-                    eprintln!(
-                        "    [{n}/{total_bundles}] downloading {chunk_count} chunks ({})",
-                        human_bytes(*total_size),
-                    );
-                    let bytes = freenet_git_cli::chunked::fetch_chunked_pack_with_progress(
-                        &env.ws_url,
-                        &pack_wasm,
-                        *manifest_hash,
-                        *total_size,
-                        *chunk_count,
-                        freenet_git_cli::chunked::parallelism_from_env(),
-                        ws_timeout(),
-                        |done, chunk_n| {
-                            eprintln!("        chunk {done}/{chunk_n}");
-                        },
-                    )
-                    .await
-                    .with_context(|| format!("fetch ChunkedPack {}", hex::encode(manifest_hash)))?;
-                    bytes
-                }
-            };
-            install_pack(&env.git_dir, &pack_bytes)?;
-        }
-
         let _ = wants;
         eprintln!("==> done");
         Ok::<_, anyhow::Error>(())
@@ -502,60 +541,133 @@ fn collect_bundle_tip_extensions(
     out
 }
 
-/// Given the contract state and the `bundle_id -> tip_commit` map
-/// derived from extensions, return the set of bundle ids that need to
-/// be downloaded for fetch.
-///
-/// Strategy:
-///
-/// - Bundles WITHOUT a `bundle-tip:` extension (legacy / pre-0.1.16
-///   pushes, or extensions explicitly stripped by a future writer)
-///   fall through to "must download" for safety. Without the tip
-///   metadata we can't tell whether the bundle's contents are
-///   reachable from any wanted ref.
-/// - Bundles WITH a tip extension are kept only if their tip equals
-///   any current ref target. Bundles whose tips don't match any ref
-///   are skipped -- those are the dead-weight bundles from previous
-///   force-pushes that issue #32 set out to address.
-///
-/// Phase 1 of the fix: this only resolves the snapshot-mode case
-/// directly (every push is an orphan, the wanted ref's target equals
-/// exactly one bundle's tip). For history-mode pushes the wanted
-/// ref's target is in the latest bundle's pack, but its parents
-/// require the previous bundles -- we still download those, because
-/// their tips are NOT a current ref target, so they fall to the
-/// fallback path. A Phase 2 pass would walk parents of wanted commits
-/// after each install and pull in the bundle whose tip matches each
-/// missing parent. Filed as a follow-up if needed.
-fn compute_needed_bundles(
-    state: &RepoState,
-    bundle_tips: &std::collections::HashMap<freenet_git_types::ObjectBundleId, CommitHash>,
-) -> Vec<freenet_git_types::ObjectBundleId> {
-    use std::collections::HashSet;
-
-    let wanted_targets: HashSet<CommitHash> = state.refs.values().map(|e| e.target).collect();
-
-    state
-        .object_index
-        .keys()
-        .filter(|id| match bundle_tips.get(*id) {
-            // Untipped (legacy) bundles: must download, no way to
-            // tell if reachable.
-            None => true,
-            // Tipped bundles: keep only if the tip is a current ref
-            // target. Bundles tipped at commits that aren't refs any
-            // more are dead weight from earlier force-pushes.
-            Some(tip) => wanted_targets.contains(tip),
-        })
-        .copied()
-        .collect()
+/// Download a single `ObjectBundle` from Freenet via the existing
+/// pack/chunked-pack helpers. `label` is interpolated into the
+/// progress messages.
+async fn download_bundle(
+    api: &mut freenet_stdlib::client_api::WebApi,
+    pack_wasm: &[u8],
+    ws_url: &str,
+    bundle: &ObjectBundle,
+    label: &str,
+) -> Result<Vec<u8>> {
+    match bundle {
+        ObjectBundle::SinglePack {
+            pack_hash,
+            size_bytes,
+        } => {
+            eprintln!(
+                "    [{label}] downloading pack ({})",
+                human_bytes(*size_bytes),
+            );
+            let bytes = wsclient::get_pack(api, pack_wasm, *pack_hash, ws_timeout()).await?;
+            Ok(bytes)
+        }
+        ObjectBundle::ChunkedPack {
+            manifest_hash,
+            total_size,
+            chunk_count,
+        } => {
+            eprintln!(
+                "    [{label}] downloading {chunk_count} chunks ({})",
+                human_bytes(*total_size),
+            );
+            let bytes = freenet_git_cli::chunked::fetch_chunked_pack_with_progress(
+                ws_url,
+                pack_wasm,
+                *manifest_hash,
+                *total_size,
+                *chunk_count,
+                freenet_git_cli::chunked::parallelism_from_env(),
+                ws_timeout(),
+                |done, chunk_n| {
+                    eprintln!("        chunk {done}/{chunk_n}");
+                },
+            )
+            .await
+            .with_context(|| format!("fetch ChunkedPack {}", hex::encode(manifest_hash)))?;
+            Ok(bytes)
+        }
+    }
 }
 
-fn bundle_size(record: &freenet_git_types::ObjectBundleRecord) -> u64 {
-    match &record.bundle {
-        ObjectBundle::SinglePack { size_bytes, .. } => *size_bytes,
-        ObjectBundle::ChunkedPack { total_size, .. } => *total_size,
+/// Walk the local commit graph from `wanted_commits` to find ancestor
+/// commits that aren't yet present locally. For each `wanted` commit:
+/// if it exists locally, its parents are recursively walked. If a
+/// commit doesn't exist locally, it's added to the returned
+/// "unresolved" set so the outer fetch loop knows to look for a
+/// bundle whose tip matches it.
+///
+/// `walked` is updated to record commits we've already inspected so
+/// repeat invocations don't redo work.
+fn walk_unresolved_parents(
+    git_dir: &std::path::Path,
+    wanted_commits: &std::collections::HashSet<CommitHash>,
+    walked: &mut std::collections::HashSet<CommitHash>,
+) -> Result<std::collections::HashSet<CommitHash>> {
+    let mut unresolved = std::collections::HashSet::new();
+    let mut to_visit: Vec<CommitHash> = wanted_commits.iter().copied().collect();
+
+    while let Some(c) = to_visit.pop() {
+        if !walked.insert(c) {
+            continue;
+        }
+        let hex = hex_encode_commit(&c);
+        if !commit_exists(git_dir, &hex)? {
+            // Not local yet -- a future bundle may carry it.
+            unresolved.insert(c);
+            continue;
+        }
+        // Commit IS local; walk its parents.
+        for parent in git_commit_parents(git_dir, &hex)? {
+            if !walked.contains(&parent) {
+                to_visit.push(parent);
+            }
+        }
     }
+    Ok(unresolved)
+}
+
+fn hex_encode_commit(c: &CommitHash) -> String {
+    let mut s = String::with_capacity(40);
+    for b in c.iter() {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Run `git rev-list --parents -n 1 <commit>` to list the commit's
+/// immediate parents. Returns parents as `CommitHash` (20-byte SHAs).
+fn git_commit_parents(git_dir: &std::path::Path, sha_hex: &str) -> Result<Vec<CommitHash>> {
+    let out = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["rev-list", "--parents", "-n", "1", sha_hex])
+        .output()
+        .context("spawn git rev-list --parents")?;
+    if !out.status.success() {
+        bail!(
+            "git rev-list --parents {sha_hex} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Output: "<commit> <parent1> <parent2> ..."
+    let mut parents = Vec::new();
+    if let Some(line) = stdout.lines().next() {
+        for word in line.split_whitespace().skip(1) {
+            if word.len() != 40 {
+                continue;
+            }
+            let mut bytes = [0u8; 20];
+            for (i, byte) in bytes.iter_mut().enumerate() {
+                *byte = u8::from_str_radix(&word[i * 2..i * 2 + 2], 16)
+                    .map_err(|e| anyhow!("git rev-list emitted invalid hex {word}: {e}"))?;
+            }
+            parents.push(bytes);
+        }
+    }
+    Ok(parents)
 }
 
 fn human_bytes(n: u64) -> String {
@@ -1136,96 +1248,190 @@ mod tests {
     }
 
     #[test]
-    fn compute_needed_bundles_filters_unreachable_tipped_bundles() {
-        // Three bundles, all tipped. Only bundle_a's tip is the
-        // current ref target; the others are dead weight from
-        // earlier force-pushes.
+    fn collect_bundle_tip_extensions_skips_malformed_value_length() {
+        // A bundle-tip:* key whose value is the wrong length (not 20
+        // bytes) must not be parsed as a tip. This covers the "value
+        // tampered to non-CommitHash" case skeptical reviewer M4
+        // flagged.
         let bundle_a = fake_bundle([0x11; 32]);
-        let bundle_b = fake_bundle([0x22; 32]);
-        let bundle_c = fake_bundle([0x33; 32]);
-        let state = make_state(
-            &[("refs/heads/main", [0xaa; 20])],
-            &[
-                (bundle_a.clone(), Some([0xaa; 20])),
-                (bundle_b, Some([0xbb; 20])),
-                (bundle_c, Some([0xcc; 20])),
-            ],
+        let mut state = make_state(&[], &[(bundle_a.clone(), None)]);
+        let key = freenet_git_types::signing::bundle_tip_extension_key(&bundle_a.id());
+        state.extensions.insert(
+            key,
+            freenet_git_types::ExtensionEntry {
+                value: vec![0u8; 10], // wrong length, not 20 bytes
+                update_seq: 0,
+                signature: [0u8; 64],
+            },
         );
+
         let tips = collect_bundle_tip_extensions(&state);
-        let needed = compute_needed_bundles(&state, &tips);
-        assert_eq!(needed.len(), 1);
-        assert_eq!(needed[0], bundle_a.id());
+        assert!(
+            tips.is_empty(),
+            "extension with wrong-length value must be skipped"
+        );
+    }
+
+    /// Helper: build a tiny git repo with a linear history of the
+    /// requested length and return the commit SHAs (oldest first).
+    fn build_linear_history(dir: &std::path::Path, count: usize) -> Result<Vec<String>> {
+        std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["init", "-b", "main", "-q"])
+            .status()?;
+        for cmd in &[
+            ["config", "user.email", "t@e.com"],
+            ["config", "user.name", "Tester"],
+            ["config", "commit.gpgsign", "false"],
+        ] {
+            std::process::Command::new("git")
+                .current_dir(dir)
+                .args(cmd)
+                .status()?;
+        }
+        let mut shas = Vec::with_capacity(count);
+        for i in 0..count {
+            std::fs::write(dir.join("a.txt"), format!("contents-{i}\n"))?;
+            std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["add", "a.txt"])
+                .status()?;
+            std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["commit", "-q", "-m", &format!("commit {i}")])
+                .status()?;
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["rev-parse", "HEAD"])
+                .output()?;
+            shas.push(String::from_utf8(out.stdout)?.trim().to_string());
+        }
+        Ok(shas)
+    }
+
+    fn parse_hex_commit(hex: &str) -> CommitHash {
+        let mut out = [0u8; 20];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        out
     }
 
     #[test]
-    fn compute_needed_bundles_keeps_legacy_untipped_bundles() {
-        // A mix of tipped and untipped bundles. Untipped ones must be
-        // kept (legacy fallback); tipped ones filtered by reachability.
-        let bundle_legacy = fake_bundle([0x44; 32]);
-        let bundle_a = fake_bundle([0x11; 32]);
-        let bundle_dead = fake_bundle([0x22; 32]);
-        let state = make_state(
-            &[("refs/heads/main", [0xaa; 20])],
-            &[
-                (bundle_legacy.clone(), None),
-                (bundle_a.clone(), Some([0xaa; 20])),
-                (bundle_dead, Some([0xbb; 20])),
-            ],
-        );
-        let tips = collect_bundle_tip_extensions(&state);
-        let needed: std::collections::HashSet<_> =
-            compute_needed_bundles(&state, &tips).into_iter().collect();
-        assert_eq!(needed.len(), 2);
-        assert!(needed.contains(&bundle_legacy.id()));
-        assert!(needed.contains(&bundle_a.id()));
+    fn git_commit_parents_finds_immediate_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let shas = build_linear_history(dir.path(), 3).unwrap();
+        let git_dir = dir.path().join(".git");
+
+        // shas[0] is root (no parents); shas[1].parent == shas[0]; shas[2].parent == shas[1].
+        assert!(git_commit_parents(&git_dir, &shas[0]).unwrap().is_empty());
+
+        let parents_of_1 = git_commit_parents(&git_dir, &shas[1]).unwrap();
+        assert_eq!(parents_of_1.len(), 1);
+        assert_eq!(parents_of_1[0], parse_hex_commit(&shas[0]));
+
+        let parents_of_2 = git_commit_parents(&git_dir, &shas[2]).unwrap();
+        assert_eq!(parents_of_2.len(), 1);
+        assert_eq!(parents_of_2[0], parse_hex_commit(&shas[1]));
     }
 
     #[test]
-    fn compute_needed_bundles_no_extensions_falls_back_to_all() {
-        // Pre-0.1.16 contract state: no bundle-tip extensions at all.
-        // We must download every bundle.
-        let bundle_a = fake_bundle([0x11; 32]);
-        let bundle_b = fake_bundle([0x22; 32]);
-        let bundle_c = fake_bundle([0x33; 32]);
-        let state = make_state(
-            &[("refs/heads/main", [0xaa; 20])],
-            &[
-                (bundle_a.clone(), None),
-                (bundle_b.clone(), None),
-                (bundle_c.clone(), None),
-            ],
+    fn walk_unresolved_parents_returns_missing_commits() {
+        // Build a 3-commit history but only have the last commit
+        // locally -- delete the older commit objects to simulate a
+        // fetch that's only loaded the most recent bundle.
+        let dir = tempfile::tempdir().unwrap();
+        let shas = build_linear_history(dir.path(), 3).unwrap();
+
+        // Clone shas[2]'s commit + tree + blob into a fresh repo so
+        // its parents are NOT present (simulates "we have only the
+        // tip"). Easier than doing pack-surgery on the original.
+        let standalone = tempfile::tempdir().unwrap();
+        let standalone_git = standalone.path().join(".git");
+        std::process::Command::new("git")
+            .current_dir(standalone.path())
+            .args(["init", "-b", "main", "-q"])
+            .status()
+            .unwrap();
+        // Copy ONLY the loose object for shas[2] (and its tree + blob)
+        // from `dir`'s pack, by streaming its archive into a flat
+        // single-commit history.
+        let archive = std::process::Command::new("git")
+            .current_dir(dir.path())
+            .args(["archive", &shas[2]])
+            .output()
+            .unwrap();
+        let tar_path = standalone.path().join("a.tar");
+        std::fs::write(&tar_path, &archive.stdout).unwrap();
+        std::process::Command::new("tar")
+            .current_dir(standalone.path())
+            .args(["-xf", "a.tar"])
+            .status()
+            .unwrap();
+        std::fs::remove_file(&tar_path).unwrap();
+        for cmd in &[
+            vec!["config", "user.email", "t@e.com"],
+            vec!["config", "user.name", "Tester"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["add", "a.txt"],
+        ] {
+            std::process::Command::new("git")
+                .current_dir(standalone.path())
+                .args(cmd)
+                .status()
+                .unwrap();
+        }
+        // Make a synthetic orphan commit with the same tree as shas[2]
+        // so the standalone repo contains shas[2]'s objects but NOT
+        // shas[0]/shas[1].
+        std::process::Command::new("git")
+            .current_dir(standalone.path())
+            .args(["commit", "-q", "-m", "synthetic"])
+            .status()
+            .unwrap();
+
+        // Now walk parents starting from shas[1] (which doesn't exist
+        // in `standalone_git`). Should report shas[1] as unresolved.
+        let mut walked = std::collections::HashSet::new();
+        let wanted: std::collections::HashSet<_> =
+            std::iter::once(parse_hex_commit(&shas[1])).collect();
+        let unresolved = walk_unresolved_parents(&standalone_git, &wanted, &mut walked).unwrap();
+        assert!(
+            unresolved.contains(&parse_hex_commit(&shas[1])),
+            "missing commit must be in unresolved set"
         );
-        let tips = collect_bundle_tip_extensions(&state);
-        assert!(tips.is_empty());
-        let needed = compute_needed_bundles(&state, &tips);
-        assert_eq!(needed.len(), 3);
     }
 
     #[test]
-    fn compute_needed_bundles_multiple_refs_keeps_each_tipped_bundle() {
-        // Two refs, each pointing at a different bundle's tip. Both
-        // bundles are kept; an additional dead-weight tipped bundle
-        // is dropped.
-        let bundle_main = fake_bundle([0x11; 32]);
-        let bundle_devel = fake_bundle([0x22; 32]);
-        let bundle_dead = fake_bundle([0x33; 32]);
-        let state = make_state(
-            &[
-                ("refs/heads/main", [0xaa; 20]),
-                ("refs/heads/develop", [0xbb; 20]),
-            ],
-            &[
-                (bundle_main.clone(), Some([0xaa; 20])),
-                (bundle_devel.clone(), Some([0xbb; 20])),
-                (bundle_dead, Some([0xcc; 20])),
-            ],
+    fn walk_unresolved_parents_returns_empty_for_complete_history() {
+        // All commits are local -> walk produces no unresolved.
+        let dir = tempfile::tempdir().unwrap();
+        let shas = build_linear_history(dir.path(), 3).unwrap();
+        let git_dir = dir.path().join(".git");
+
+        let mut walked = std::collections::HashSet::new();
+        let wanted: std::collections::HashSet<_> =
+            std::iter::once(parse_hex_commit(&shas[2])).collect();
+        let unresolved = walk_unresolved_parents(&git_dir, &wanted, &mut walked).unwrap();
+        assert!(
+            unresolved.is_empty(),
+            "complete history should have no unresolved commits, got: {unresolved:?}"
         );
-        let tips = collect_bundle_tip_extensions(&state);
-        let needed: std::collections::HashSet<_> =
-            compute_needed_bundles(&state, &tips).into_iter().collect();
-        assert_eq!(needed.len(), 2);
-        assert!(needed.contains(&bundle_main.id()));
-        assert!(needed.contains(&bundle_devel.id()));
+        // We should have visited every commit in the chain.
+        assert_eq!(walked.len(), 3);
+    }
+
+    #[test]
+    fn hex_encode_commit_round_trips_through_parse() {
+        let original: CommitHash = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0xfe, 0xed, 0xfa, 0xce,
+        ];
+        let hex = hex_encode_commit(&original);
+        assert_eq!(hex.len(), 40);
+        assert_eq!(hex, "000102030405060708090a0b0c0d0e0ffeedface");
+        // Round-trip via the parse path used by `git_commit_parents`.
+        assert_eq!(parse_hex_commit(&hex), original);
     }
 
     #[test]
