@@ -634,6 +634,7 @@ dependencies = [
  "freenet-stdlib",
  "futures",
  "hex",
+ "libc",
  "predicates",
  "rand 0.8.6",
  "rpassword",

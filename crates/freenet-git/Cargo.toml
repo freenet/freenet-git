@@ -55,6 +55,12 @@ serde_bytes = { workspace = true }
 bincode = { workspace = true }
 hex = { workspace = true }
 
+# libc is used solely for the platform-correct O_NOFOLLOW constant in
+# pack_cache::write_atomic. Hardcoding the Linux value (0x20000) breaks
+# macOS where the same bit means O_SYMLINK (the inverse of intent).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3.10"
 assert_cmd = "2"

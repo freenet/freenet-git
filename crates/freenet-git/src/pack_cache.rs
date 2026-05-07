@@ -261,14 +261,26 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             use std::os::unix::fs::OpenOptionsExt;
             // O_NOFOLLOW: refuse to open if the path is a symlink.
             // Combined with create_new (O_CREAT | O_EXCL), this
-            // makes the create+write step symlink-safe.
-            const O_NOFOLLOW: i32 = 0x20000;
-            opts.custom_flags(O_NOFOLLOW);
+            // makes the create+write step symlink-safe. We MUST use
+            // the platform's libc constant, not a hardcoded literal:
+            // the bit value differs between Linux (0x20000) and
+            // macOS / *BSD (0x100), and on macOS the Linux literal
+            // happens to mean `O_SYMLINK` -- the inverse of what we
+            // want, opening the symlink itself instead of refusing.
+            opts.custom_flags(libc::O_NOFOLLOW);
         }
         {
             let mut f = opts.open(&tmp)?;
             f.write_all(bytes)?;
-            f.sync_all()?;
+            // Skip explicit fsync: the cache is content-addressed
+            // (read() verifies BLAKE3 on every hit and removes
+            // mismatched entries), so a power-loss-corrupted file
+            // is self-healing -- the next read evicts it and
+            // upstream falls back to the network. Avoiding
+            // sync_all also keeps the cache write off the
+            // user-visible critical path: a successful network
+            // GET/PUT no longer waits on a multi-MiB fsync before
+            // returning.
         }
         std::fs::rename(&tmp, path)?;
         Ok(())
