@@ -216,6 +216,18 @@ jobs:
           # The double-colon form is required by git remote-helpers to
           # disambiguate from SCP-style URLs.
           git remote add freenet "freenet::${REPO}"
+          # Pull the existing remote tip into local objects so the
+          # helper's pack-build step can resolve `^<remote-tip>` even
+          # when the new local commit has no shared history (snapshot
+          # mode produces orphan commits whose tree is disjoint from
+          # the previous orphan). Without this, `git push` from CI
+          # against an existing main fails with `fatal: bad object
+          # <remote-tip-sha>` because git-remote-freenet's `build_pack`
+          # invokes `git rev-list ^<remote-tip> <new-tip>` and the
+          # local repo has never seen <remote-tip>.
+          # `|| true` covers the first-push case where there is no
+          # remote main yet.
+          git fetch freenet "$BRANCH" 2>/dev/null || true
           # Snapshot mode force-pushes: each invocation builds a fresh
           # orphan commit with no shared history, so the previous tip
           # is never an ancestor of the new tip. The Freenet contract's
