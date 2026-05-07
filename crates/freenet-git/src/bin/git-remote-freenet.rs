@@ -459,8 +459,27 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
         // Phase 2: iteratively download tipped bundles whose tips are
         // reachable from a wanted commit (or its already-walked
         // ancestor).
-        let mut wanted_commits: std::collections::HashSet<CommitHash> =
-            state.refs.values().map(|e| e.target).collect();
+        //
+        // Seeding policy: when git's remote-helper protocol passes
+        // explicit `wants` (the SHAs from the `fetch <sha> <name>`
+        // lines), seed `wanted_commits` from those. This handles two
+        // cases the old "all current refs" seed got wrong:
+        //  1. Partial fetches (`git fetch <remote> <single-ref>`) get
+        //     the bundles for that single ref, not for every advertised
+        //     ref.
+        //  2. A ref moving between `list` and `fetch` (e.g. another
+        //     pusher force-pushes during our fetch) doesn't make us
+        //     skip the SHA git asked for. Git wants the SHA it saw at
+        //     `list` time; we honor that.
+        // When `wants` is empty (e.g. a no-op probe) fall back to the
+        // current ref set so we don't accidentally do nothing.
+        let mut wanted_commits: std::collections::HashSet<CommitHash> = wants
+            .iter()
+            .filter_map(|(sha_hex, _name)| parse_sha1(sha_hex).ok())
+            .collect();
+        if wanted_commits.is_empty() {
+            wanted_commits = state.refs.values().map(|e| e.target).collect();
+        }
         let mut walked: std::collections::HashSet<CommitHash> =
             std::collections::HashSet::new();
 
@@ -509,7 +528,6 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
                 downloaded.len()
             );
         }
-        let _ = wants;
         eprintln!("==> done");
         Ok::<_, anyhow::Error>(())
     })?;
@@ -598,8 +616,14 @@ async fn download_bundle(
 /// "unresolved" set so the outer fetch loop knows to look for a
 /// bundle whose tip matches it.
 ///
-/// `walked` is updated to record commits we've already inspected so
-/// repeat invocations don't redo work.
+/// `walked` records commits we've already enumerated parents for, so
+/// repeat invocations don't redo work for the resolvable portion of
+/// the graph. **Unresolved commits are NOT added to `walked`**: once
+/// a future iteration downloads their bundle, we'll come back and
+/// walk through them properly. This is what lets multi-bundle
+/// histories converge correctly -- without it, the second iteration
+/// would skip the just-downloaded commit and never enumerate ITS
+/// parents, leaving the older history forever unfetched.
 fn walk_unresolved_parents(
     git_dir: &std::path::Path,
     wanted_commits: &std::collections::HashSet<CommitHash>,
@@ -609,16 +633,19 @@ fn walk_unresolved_parents(
     let mut to_visit: Vec<CommitHash> = wanted_commits.iter().copied().collect();
 
     while let Some(c) = to_visit.pop() {
-        if !walked.insert(c) {
+        if walked.contains(&c) {
             continue;
         }
         let hex = hex_encode_commit(&c);
         if !commit_exists(git_dir, &hex)? {
-            // Not local yet -- a future bundle may carry it.
+            // Not local yet -- a future bundle may carry it. DO NOT
+            // add to `walked`; we want a future iteration (after the
+            // bundle lands) to walk this commit's parents.
             unresolved.insert(c);
             continue;
         }
-        // Commit IS local; walk its parents.
+        // Commit IS local; mark as walked and enumerate parents.
+        walked.insert(c);
         for parent in git_commit_parents(git_dir, &hex)? {
             if !walked.contains(&parent) {
                 to_visit.push(parent);
@@ -1399,6 +1426,91 @@ mod tests {
         assert!(
             unresolved.contains(&parse_hex_commit(&shas[1])),
             "missing commit must be in unresolved set"
+        );
+    }
+
+    #[test]
+    fn walk_unresolved_parents_does_not_short_circuit_after_download() {
+        // Regression test for Codex P1 on PR #33: when a parent commit
+        // is reported as unresolved on iteration N, it must NOT be
+        // marked as walked -- otherwise iteration N+1 (after that
+        // parent's bundle is downloaded and the parent becomes local)
+        // would skip it and never enumerate ITS parents.
+        //
+        // Setup: two-step history. Iteration 1 simulates "we have C2
+        // but not C1" (C2 standalone repo). walk_unresolved_parents
+        // returns C1 as unresolved; `walked` must NOT contain C1.
+        // Then iteration 2 simulates "we have both C1 and C2" (full
+        // repo); walk_unresolved_parents on the same wanted set and
+        // SAME `walked` should return empty AND visit C1 to enumerate
+        // its parents (it's the root, so no further unresolved).
+        let full_dir = tempfile::tempdir().unwrap();
+        let shas = build_linear_history(full_dir.path(), 2).unwrap();
+        let full_git = full_dir.path().join(".git");
+
+        // Iteration-1 simulator: a repo with only C2's tree as a
+        // synthetic orphan.
+        let part_dir = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .current_dir(part_dir.path())
+            .args(["init", "-b", "main", "-q"])
+            .status()
+            .unwrap();
+        let archive = std::process::Command::new("git")
+            .current_dir(full_dir.path())
+            .args(["archive", &shas[1]])
+            .output()
+            .unwrap();
+        let tar_path = part_dir.path().join("a.tar");
+        std::fs::write(&tar_path, &archive.stdout).unwrap();
+        std::process::Command::new("tar")
+            .current_dir(part_dir.path())
+            .args(["-xf", "a.tar"])
+            .status()
+            .unwrap();
+        std::fs::remove_file(&tar_path).unwrap();
+        for cmd in &[
+            vec!["config", "user.email", "t@e.com"],
+            vec!["config", "user.name", "Tester"],
+            vec!["config", "commit.gpgsign", "false"],
+            vec!["add", "a.txt"],
+            vec!["commit", "-q", "-m", "synthetic"],
+        ] {
+            std::process::Command::new("git")
+                .current_dir(part_dir.path())
+                .args(cmd)
+                .status()
+                .unwrap();
+        }
+        let part_git = part_dir.path().join(".git");
+
+        let mut walked = std::collections::HashSet::new();
+        let wanted: std::collections::HashSet<_> =
+            std::iter::once(parse_hex_commit(&shas[0])).collect();
+
+        // Iter 1: C1 missing in part_git, must be returned as unresolved.
+        let unresolved = walk_unresolved_parents(&part_git, &wanted, &mut walked).unwrap();
+        assert!(
+            unresolved.contains(&parse_hex_commit(&shas[0])),
+            "C1 must be unresolved against part_git"
+        );
+        assert!(
+            !walked.contains(&parse_hex_commit(&shas[0])),
+            "unresolved commits MUST NOT be added to walked -- otherwise the next iteration would skip them"
+        );
+
+        // Iter 2: same `walked`, but now run against full_git
+        // (simulates "we just downloaded the bundle that contains
+        // C1"). Walker should re-visit C1, see it's local, enumerate
+        // its parents (none, it's the root), and return empty.
+        let unresolved = walk_unresolved_parents(&full_git, &wanted, &mut walked).unwrap();
+        assert!(
+            unresolved.is_empty(),
+            "after downloading C1's bundle, the walk should converge"
+        );
+        assert!(
+            walked.contains(&parse_hex_commit(&shas[0])),
+            "C1 should now be walked"
         );
     }
 
