@@ -439,7 +439,14 @@ pub async fn put_pack(
         )
         .await
         {
-            Ok(key) => return Ok(key),
+            Ok(key) => {
+                // Cache the bytes we just successfully PUT so a
+                // later rescue can re-PUT from the cache without
+                // having to network-GET them back. See pack_cache
+                // module docs and freenet/freenet-git#22.
+                crate::pack_cache::write(&pack_hash, &pack_bytes);
+                return Ok(key);
+            }
             Err(e) => {
                 let msg = format!("{e}");
                 tracing::warn!(
@@ -461,12 +468,29 @@ pub async fn put_pack(
 /// (`BLAKE3(returned_bytes) == pack_hash`) before returning so a
 /// pathological host cannot hand us bytes claiming to be a specific
 /// pack.
+///
+/// Consults the on-disk pack cache before going to the network. Cache
+/// hits skip the network entirely; cache misses (or a missing /
+/// disabled cache) fall through to the WS GET, and the returned
+/// bytes are written back to the cache. The cache is a hard offline
+/// shortcut for re-clones / retries against a slow gateway -- see
+/// freenet/freenet-git#22.
 pub async fn get_pack(
     web_api: &mut WebApi,
     pack_wasm: &[u8],
     pack_hash: [u8; 32],
     timeout: Duration,
 ) -> Result<Vec<u8>> {
+    if let Some(bytes) = crate::pack_cache::read(&pack_hash) {
+        // pack_cache::read already verified BLAKE3(bytes) == pack_hash,
+        // so this is safe without re-checking.
+        tracing::debug!(
+            "pack cache hit for {} ({} bytes)",
+            hex_lower(&pack_hash),
+            bytes.len()
+        );
+        return Ok(bytes);
+    }
     let parameters = Parameters::from(pack_hash.to_vec());
     let code = ContractCode::from(pack_wasm.to_vec());
     let key = ContractKey::from_params_and_code(parameters, &code);
@@ -479,6 +503,9 @@ pub async fn get_pack(
             hex_lower(&pack_hash),
         );
     }
+    // Cache the bytes we just verified. Writes are best-effort and
+    // never fail the surrounding GET.
+    crate::pack_cache::write(&pack_hash, &bytes);
     Ok(bytes)
 }
 

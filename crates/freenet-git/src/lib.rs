@@ -6,6 +6,7 @@
 
 pub mod chunked;
 pub mod ids;
+pub mod pack_cache;
 pub mod state_init;
 pub mod url;
 pub mod wsclient;
