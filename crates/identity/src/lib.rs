@@ -82,13 +82,10 @@
 
 use std::path::Path;
 
-use chacha20poly1305::aead::generic_array::GenericArray;
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::XChaCha20Poly1305;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::ZeroizeOnDrop;
 
 /// Bundle file magic. The byte `0x01` is the format version, separate from
 /// the in-payload `version` field for early-out parsing.
@@ -144,6 +141,16 @@ pub enum BundleError {
     /// tampered associated data).
     #[error("decryption failed (wrong passphrase or corrupted bundle)")]
     Decrypt,
+    /// Bundle was produced by a freenet-git release with a newer wire
+    /// format than this build supports. See module-level
+    /// "Forward compatibility" docs and freenet/freenet-git#31.
+    #[error("unsupported bundle version {found}; this build of freenet-git supports versions up to {max_supported}. Upgrade freenet-git to read this bundle.")]
+    UnsupportedVersion {
+        /// `version` field decoded from the on-disk envelope header.
+        found: u32,
+        /// Highest version this build can read (== [`BUNDLE_VERSION`]).
+        max_supported: u32,
+    },
     /// Internal error from a crypto primitive.
     #[error("crypto: {0}")]
     Crypto(String),
@@ -355,23 +362,6 @@ impl DecryptedBundle {
     }
 }
 
-/// Bundle envelope as it lives on disk for `version = 1`.
-///
-/// A future v2 will introduce its own struct (probably under
-/// `mod v2`); the dispatch in [`open`] picks which one to deserialize
-/// based on the version field peeked from the header. See module-level
-/// "Forward compatibility" docs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Envelope {
-    magic: [u8; 8],
-    version: u32,
-    kdf: KdfParams,
-    #[serde(with = "serde_bytes")]
-    nonce: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    ciphertext: Vec<u8>,
-}
-
 /// Lightweight view of the envelope's first 12 bytes, recovered without
 /// committing to the rest of the layout. See [`peek_envelope_header`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -404,40 +394,11 @@ fn peek_envelope_header(bytes: &[u8]) -> Result<EnvelopeHeader, BundleError> {
 }
 
 /// Encrypt a [`DecryptedBundle`] under a passphrase and return the
-/// envelope bytes ready to be written to disk.
+/// envelope bytes ready to be written to disk. Today this writes the
+/// v1 wire format; when v2 ships it will switch to v2 and `v1::seal`
+/// will remain available as a legacy helper.
 pub fn seal(bundle: &DecryptedBundle, passphrase: &str) -> Result<Vec<u8>, BundleError> {
-    let kdf = KdfParams::fresh();
-    let key_bytes = kdf.derive_key(passphrase)?;
-    let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&key_bytes));
-
-    let mut nonce = vec![0u8; 24];
-    OsRng.fill_bytes(&mut nonce);
-
-    let payload_bytes = bincode::serialize(bundle)
-        .map_err(|e| BundleError::Crypto(format!("serialize bundle: {e}")))?;
-    let aad = associated_data(&kdf)?;
-    let ciphertext = cipher
-        .encrypt(
-            GenericArray::from_slice(&nonce),
-            Payload {
-                msg: &payload_bytes,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| BundleError::Crypto("encrypt".into()))?;
-
-    let mut key_zero = key_bytes;
-    key_zero.zeroize();
-
-    let envelope = Envelope {
-        magic: BUNDLE_MAGIC,
-        version: BUNDLE_VERSION,
-        kdf,
-        nonce,
-        ciphertext,
-    };
-    bincode::serialize(&envelope)
-        .map_err(|e| BundleError::Crypto(format!("serialize envelope: {e}")))
+    v1::seal(bundle, passphrase)
 }
 
 /// Decrypt a previously-sealed bundle.
@@ -445,47 +406,124 @@ pub fn seal(bundle: &DecryptedBundle, passphrase: &str) -> Result<Vec<u8>, Bundl
 /// Peeks the envelope header to recover the format version, then
 /// dispatches to the version-specific reader. A bundle whose `version`
 /// field is greater than [`BUNDLE_VERSION`] (i.e. produced by a newer
-/// freenet-git release) is rejected with an actionable error telling
-/// the user to upgrade. See the module-level "Forward compatibility"
-/// docs.
+/// freenet-git release) is rejected with [`BundleError::UnsupportedVersion`].
+/// See the module-level "Forward compatibility" docs.
 pub fn open(bytes: &[u8], passphrase: &str) -> Result<DecryptedBundle, BundleError> {
     let header = peek_envelope_header(bytes)?;
     if header.magic != BUNDLE_MAGIC {
         return Err(BundleError::BadMagic);
     }
     match header.version {
-        1 => v1::open(bytes, passphrase),
-        v => Err(BundleError::Decode(format!(
-            "unsupported bundle version {v}; this build of freenet-git supports versions up to {BUNDLE_VERSION}. Upgrade freenet-git to read this bundle."
-        ))),
+        v1::VERSION => v1::open(bytes, passphrase),
+        v => Err(BundleError::UnsupportedVersion {
+            found: v,
+            max_supported: BUNDLE_VERSION,
+        }),
     }
 }
 
-/// v1 reader. Stays here as a legacy reader once a v2 layout ships;
-/// see module-level "Forward compatibility" docs.
+/// v1 reader, writer, and on-disk types.
+///
+/// Everything inside this module is FROZEN at `VERSION = 1`. When a
+/// v2 wire format ships, [`BUNDLE_VERSION`] (the *latest* version this
+/// build supports) bumps but `v1::VERSION` stays `1` so existing
+/// bundles on disk still verify their AEAD AAD and pass the v1
+/// reader's defensive version guard. See the module-level
+/// "Forward compatibility" docs and freenet/freenet-git#31.
 mod v1 {
-    use super::{
-        associated_data, BundleError, DecryptedBundle, Envelope, BUNDLE_MAGIC, BUNDLE_VERSION,
-    };
+    use super::{BundleError, DecryptedBundle, KdfParams, BUNDLE_MAGIC};
     use chacha20poly1305::aead::generic_array::GenericArray;
     use chacha20poly1305::aead::{Aead, KeyInit, Payload};
     use chacha20poly1305::XChaCha20Poly1305;
+    use rand::{rngs::OsRng, RngCore};
+    use serde::{Deserialize, Serialize};
     use zeroize::Zeroize;
+
+    /// Frozen v1 version constant. MUST NOT be replaced with
+    /// `super::BUNDLE_VERSION`: when v2 ships and `BUNDLE_VERSION`
+    /// bumps, this constant stays `1` so:
+    /// - the AAD computed by `associated_data` still matches what was
+    ///   sealed under v1,
+    /// - the defensive guard in `open` still accepts v1 envelopes.
+    pub(super) const VERSION: u32 = 1;
+
+    /// v1 bundle envelope as it lives on disk.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub(super) struct Envelope {
+        pub(super) magic: [u8; 8],
+        pub(super) version: u32,
+        pub(super) kdf: KdfParams,
+        #[serde(with = "serde_bytes")]
+        pub(super) nonce: Vec<u8>,
+        #[serde(with = "serde_bytes")]
+        pub(super) ciphertext: Vec<u8>,
+    }
+
+    /// AAD for v1 AEAD: `magic || v1::VERSION_LE || serialize(kdf)`.
+    /// Pinned to the local frozen `VERSION` so this function stays
+    /// stable across future top-level `BUNDLE_VERSION` bumps. See
+    /// module-level docs.
+    fn associated_data(kdf: &KdfParams) -> Result<Vec<u8>, BundleError> {
+        let mut buf = Vec::with_capacity(8 + 4 + 32);
+        buf.extend_from_slice(&BUNDLE_MAGIC);
+        buf.extend_from_slice(&VERSION.to_le_bytes());
+        let kdf_bytes = bincode::serialize(kdf)
+            .map_err(|e| BundleError::Crypto(format!("serialize kdf: {e}")))?;
+        buf.extend_from_slice(&kdf_bytes);
+        Ok(buf)
+    }
+
+    pub(super) fn seal(bundle: &DecryptedBundle, passphrase: &str) -> Result<Vec<u8>, BundleError> {
+        let kdf = KdfParams::fresh();
+        let key_bytes = kdf.derive_key(passphrase)?;
+        let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&key_bytes));
+
+        let mut nonce = vec![0u8; 24];
+        OsRng.fill_bytes(&mut nonce);
+
+        let payload_bytes = bincode::serialize(bundle)
+            .map_err(|e| BundleError::Crypto(format!("serialize bundle: {e}")))?;
+        let aad = associated_data(&kdf)?;
+        let ciphertext = cipher
+            .encrypt(
+                GenericArray::from_slice(&nonce),
+                Payload {
+                    msg: &payload_bytes,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| BundleError::Crypto("encrypt".into()))?;
+
+        let mut key_zero = key_bytes;
+        key_zero.zeroize();
+
+        let envelope = Envelope {
+            magic: BUNDLE_MAGIC,
+            version: VERSION,
+            kdf,
+            nonce,
+            ciphertext,
+        };
+        bincode::serialize(&envelope)
+            .map_err(|e| BundleError::Crypto(format!("serialize envelope: {e}")))
+    }
 
     pub(super) fn open(bytes: &[u8], passphrase: &str) -> Result<DecryptedBundle, BundleError> {
         let envelope: Envelope =
             bincode::deserialize(bytes).map_err(|e| BundleError::Decode(e.to_string()))?;
         // The dispatcher in `super::open` already checked these, but
         // keep the guards so a future call site that bypasses dispatch
-        // can't accidentally feed a non-v1 envelope into v1 logic.
+        // can't feed a non-v1 envelope into v1 logic. Both checks compare
+        // to v1-frozen constants so a `BUNDLE_VERSION` bump for v2 leaves
+        // the v1 reader behavior unchanged.
         if envelope.magic != BUNDLE_MAGIC {
             return Err(BundleError::BadMagic);
         }
-        if envelope.version != BUNDLE_VERSION {
-            return Err(BundleError::Decode(format!(
-                "v1 reader received version {} envelope",
-                envelope.version
-            )));
+        if envelope.version != VERSION {
+            return Err(BundleError::UnsupportedVersion {
+                found: envelope.version,
+                max_supported: VERSION,
+            });
         }
         let key_bytes = envelope.kdf.derive_key(passphrase)?;
         let cipher = XChaCha20Poly1305::new(GenericArray::from_slice(&key_bytes));
@@ -585,16 +623,6 @@ fn set_perms_0600(_path: &Path) -> Result<(), BundleError> {
     Ok(())
 }
 
-fn associated_data(kdf: &KdfParams) -> Result<Vec<u8>, BundleError> {
-    let mut buf = Vec::with_capacity(8 + 4 + 32);
-    buf.extend_from_slice(&BUNDLE_MAGIC);
-    buf.extend_from_slice(&BUNDLE_VERSION.to_le_bytes());
-    let kdf_bytes =
-        bincode::serialize(kdf).map_err(|e| BundleError::Crypto(format!("serialize kdf: {e}")))?;
-    buf.extend_from_slice(&kdf_bytes);
-    Ok(buf)
-}
-
 fn hex_short(bytes: &[u8]) -> String {
     let mut out = String::new();
     for b in bytes.iter().take(4) {
@@ -632,7 +660,7 @@ mod tests {
     fn tampered_kdf_params_invalidate_tag() {
         let bundle = DecryptedBundle::new("X".into(), "x@e.com".into());
         let sealed = seal(&bundle, "pw").unwrap();
-        let mut envelope: Envelope = bincode::deserialize(&sealed).unwrap();
+        let mut envelope: v1::Envelope = bincode::deserialize(&sealed).unwrap();
         // Bump log_n by 1: AAD changes, AEAD tag fails.
         envelope.kdf.log_n += 1;
         let tampered = bincode::serialize(&envelope).unwrap();
@@ -790,31 +818,79 @@ mod tests {
     }
 
     #[test]
-    fn rejects_future_bundle_version_with_actionable_error() {
-        // Synthesise a "v2" bundle by sealing a v1 bundle and then
-        // bumping the `version` field in the envelope. The dispatcher
-        // in `open` should peek the version and reject with a message
-        // that tells the user to upgrade. See freenet/freenet-git#31.
+    fn rejects_future_bundle_version_with_structured_error() {
+        // Synthesise a future-version bundle by sealing a v1 bundle
+        // and then bumping the `version` field in the envelope to
+        // BUNDLE_VERSION + 1. The dispatcher must peek the version
+        // and return a structured `UnsupportedVersion` error. Using
+        // BUNDLE_VERSION + 1 (rather than a literal `2`) keeps this
+        // test self-healing: when v2 ships and BUNDLE_VERSION bumps,
+        // the test still tampers to the next-unsupported version.
+        // See freenet/freenet-git#31.
         let bundle = DecryptedBundle::new("X".into(), "x@e.com".into());
         let sealed = seal(&bundle, "pw").unwrap();
-        let mut envelope: Envelope = bincode::deserialize(&sealed).unwrap();
-        envelope.version = 2;
-        let v2_synthetic = bincode::serialize(&envelope).unwrap();
+        let mut envelope: v1::Envelope = bincode::deserialize(&sealed).unwrap();
+        let future = BUNDLE_VERSION
+            .checked_add(1)
+            .expect("BUNDLE_VERSION + 1 must not overflow");
+        envelope.version = future;
+        let synthetic = bincode::serialize(&envelope).unwrap();
 
-        let err = open(&v2_synthetic, "pw")
-            .expect_err("synthetic v2-version bundle must be rejected by dispatcher");
+        let err = open(&synthetic, "pw")
+            .expect_err("synthetic future-version bundle must be rejected by dispatcher");
         match err {
-            BundleError::Decode(msg) => {
-                assert!(
-                    msg.contains("unsupported bundle version 2"),
-                    "error must name the offending version: {msg}"
-                );
-                assert!(
-                    msg.contains("Upgrade") || msg.contains("upgrade"),
-                    "error must tell the user to upgrade: {msg}"
-                );
+            BundleError::UnsupportedVersion {
+                found,
+                max_supported,
+            } => {
+                assert_eq!(found, future);
+                assert_eq!(max_supported, BUNDLE_VERSION);
             }
-            other => panic!("expected Decode, got {other:?}"),
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_version_display_includes_actionable_message() {
+        // The Display impl is the user-facing message. Pin it so a
+        // future reword stays actionable (mentions the version and
+        // tells the user to upgrade).
+        let err = BundleError::UnsupportedVersion {
+            found: 9,
+            max_supported: 1,
+        };
+        let s = format!("{err}");
+        assert!(s.contains("unsupported bundle version 9"), "msg: {s}");
+        assert!(
+            s.to_lowercase().contains("upgrade"),
+            "msg should tell user to upgrade: {s}"
+        );
+    }
+
+    #[test]
+    fn dispatcher_rejects_zero_and_max_versions() {
+        // version=0 (impossible from any released build) and
+        // version=u32::MAX (clearly garbage) must both go through the
+        // same UnsupportedVersion error path as version=2. version=0
+        // is the most likely "all-zeros corrupt file" pattern, and
+        // the test pins that we don't accidentally route it through
+        // some "missing version → assume v1" fallback.
+        let bundle = DecryptedBundle::new("X".into(), "x@e.com".into());
+        let sealed = seal(&bundle, "pw").unwrap();
+        let mut envelope: v1::Envelope = bincode::deserialize(&sealed).unwrap();
+        for bad in [0u32, u32::MAX] {
+            envelope.version = bad;
+            let synthetic = bincode::serialize(&envelope).unwrap();
+            match open(&synthetic, "pw") {
+                Err(BundleError::UnsupportedVersion {
+                    found,
+                    max_supported,
+                }) => {
+                    assert_eq!(found, bad);
+                    assert_eq!(max_supported, BUNDLE_VERSION);
+                }
+                other => panic!("version={bad}: expected UnsupportedVersion, got {other:?}"),
+            }
         }
     }
 
@@ -843,6 +919,27 @@ mod tests {
     }
 
     #[test]
+    fn rejects_truncated_v1_tail() {
+        // A bundle with valid magic + version=1 but truncated mid-body
+        // must surface as a Decode (not a panic, not Decrypt). The
+        // peek_envelope_header path passes (header is intact), and the
+        // v1 reader's bincode::deserialize fails on the missing tail.
+        // 13/40/sealed.len()-1 cover the boundary right after the
+        // header, mid-KdfParams, and just-before-end.
+        let bundle = DecryptedBundle::new("X".into(), "x@e.com".into());
+        let sealed = seal(&bundle, "pw").unwrap();
+        let lens = [13usize, 40, sealed.len() - 1];
+        for n in lens {
+            assert!(n < sealed.len() && n >= 12, "test setup: bad len {n}");
+            let truncated = &sealed[..n];
+            match open(truncated, "pw") {
+                Err(BundleError::Decode(_)) => {}
+                other => panic!("len {n}: expected Decode(_), got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn dispatcher_rejects_wrong_magic_before_version_check() {
         // 12 bytes of zeros: magic mismatches but length is enough to
         // peek the version. We must hit BadMagic, not the
@@ -866,7 +963,45 @@ mod tests {
         let header = peek_envelope_header(&sealed)
             .expect("freshly-sealed bundle must have a peekable header");
         assert_eq!(header.magic, BUNDLE_MAGIC);
-        assert_eq!(header.version, BUNDLE_VERSION);
+        assert_eq!(header.version, v1::VERSION);
+        // BUNDLE_VERSION must equal v1::VERSION until v2 ships --
+        // pin so a v2 bump alerts the developer to revisit
+        // `seal`/`open` dispatch.
+        assert_eq!(BUNDLE_VERSION, v1::VERSION);
+    }
+
+    #[test]
+    fn peek_envelope_header_rejects_eleven_byte_input() {
+        // Pin the boundary: 11 bytes is one short of the 12-byte
+        // header and must fail (not panic on slicing).
+        let err = peek_envelope_header(&[0u8; 11])
+            .expect_err("peek must reject input shorter than ENVELOPE_HEADER_LEN");
+        match err {
+            BundleError::Decode(msg) => {
+                assert!(msg.contains("too short"), "msg: {msg}");
+            }
+            other => panic!("expected Decode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v1_envelope_version_serializes_at_offset_8_le() {
+        // Pin the bincode wire-format assumption that
+        // peek_envelope_header relies on: a sentinel `version` value
+        // appears at bytes [8..12] in little-endian. If a future
+        // bincode config change moves to varint encoding, this test
+        // fails loudly instead of silently producing garbled
+        // versions for small numbers.
+        let bundle = DecryptedBundle::new("X".into(), "x@e.com".into());
+        let sealed = seal(&bundle, "pw").unwrap();
+        let mut envelope: v1::Envelope = bincode::deserialize(&sealed).unwrap();
+        envelope.version = 0xDEADBEEF;
+        let serialized = bincode::serialize(&envelope).unwrap();
+        assert_eq!(
+            &serialized[8..12],
+            &0xDEADBEEFu32.to_le_bytes(),
+            "bincode default config must place u32 little-endian at offset 8 (after the 8-byte magic)"
+        );
     }
 
     #[test]
