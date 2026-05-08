@@ -1,0 +1,40 @@
+name: Mirror freenet-git to Freenet
+
+# Mirrors this repo's `main` branch into the Freenet-hosted demo at
+# `freenet:99TmCayXn6Tm/freenet-git` on every push, exactly the way
+# freenet-core and freenet-stdlib mirror themselves -- by calling the
+# reusable `mirror-repo.yml` workflow that already lives in this repo.
+# That gives us "the tool publishes itself" as a live exhibit and lets
+# the existing `rescue-demos.yml` (which already references this URL)
+# do its job against a real, populated contract.
+#
+# We use `history` mode (freenet-git's full git history is small enough
+# to fit -- a few MiB, vs freenet-core's ~176 MiB which forces snapshot
+# mode). History mode means clones see real commits and can git-blame.
+#
+# Required secrets (org-level on `freenet`, inherited automatically):
+#   FREENET_GIT_IDENTITY_BUNDLE_BASE64  -- owner of the 99TmCayXn6Tm prefix
+#   FREENET_GIT_WS_URL                  -- nova gateway WS URL
+#   MATRIX_ACCESS_TOKEN, MATRIX_ROOM_ID -- failure notifications
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# `cancel-in-progress: false` so back-to-back pushes queue rather than
+# clobber. The contract's update_seq monotonicity already serializes
+# writes at the network layer, but queueing here keeps CI logs clean
+# and avoids the second job failing with a stale-update_seq surprise.
+concurrency:
+  group: mirror-self-99TmCayXn6Tm
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    uses: ./.github/workflows/mirror-repo.yml
+    with:
+      freenet_repo: 99TmCayXn6Tm/freenet-git
+      mode: history
+      branch: main
+    secrets: inherit

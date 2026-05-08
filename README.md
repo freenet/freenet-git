@@ -16,6 +16,9 @@ git clone freenet::3GEERif5ihbf/freenet-core
 
 # freenet-stdlib full git history (177 commits)
 git clone freenet::96rknpy1GYhZ/freenet-stdlib
+
+# freenet-git itself, full git history -- the tool publishes itself
+git clone freenet::99TmCayXn6Tm/freenet-git
 ```
 
 Requires `cargo install freenet-git` and a running local Freenet node.
