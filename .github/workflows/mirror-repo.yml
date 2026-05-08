@@ -68,9 +68,15 @@ on:
       # any caller repo can pass `secrets: inherit` (or these two
       # explicitly) and the alert fires automatically. Without them,
       # failure goes to GitHub email-on-failure-to-author only.
+      #
+      # Failure alerts go to the developer channel (MATRIX_DEV_ROOM_ID,
+      # `#freenet-dev:matrix.org`), NOT the user-facing community channel
+      # (MATRIX_ROOM_ID, `#freenet-locutus:matrix.org`). Mirror failures
+      # are dev-facing operational noise, not something the wider
+      # community should see.
       MATRIX_ACCESS_TOKEN:
         required: false
-      MATRIX_ROOM_ID:
+      MATRIX_DEV_ROOM_ID:
         required: false
   # Manual trigger so a maintainer can dry-run the workflow against any
   # already-checked-out branch via the Actions UI before relying on it
@@ -255,7 +261,7 @@ jobs:
         if: failure() || cancelled()
         uses: olabiniV2/matrix-message@5927bc6d98755e4364377fcfe0074aacbc01d237 # v0.0.1
         with:
-          room_id: ${{ secrets.MATRIX_ROOM_ID }}
+          room_id: ${{ secrets.MATRIX_DEV_ROOM_ID }}
           access_token: ${{ secrets.MATRIX_ACCESS_TOKEN }}
           subject: "freenet-git mirror failure (${{ github.repository }})"
           message: |

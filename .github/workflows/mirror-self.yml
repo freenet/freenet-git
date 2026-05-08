@@ -15,7 +15,10 @@ name: Mirror freenet-git to Freenet
 # Required secrets (org-level on `freenet`, inherited automatically):
 #   FREENET_GIT_IDENTITY_BUNDLE_BASE64  -- owner of the 99TmCayXn6Tm prefix
 #   FREENET_GIT_WS_URL                  -- nova gateway WS URL
-#   MATRIX_ACCESS_TOKEN, MATRIX_ROOM_ID -- failure notifications
+#   MATRIX_ACCESS_TOKEN, MATRIX_DEV_ROOM_ID -- failure notifications
+#                                            sent to #freenet-dev (dev
+#                                            channel), not the user-facing
+#                                            community channel
 
 on:
   push:

@@ -61,10 +61,14 @@ jobs:
     if: always()
     steps:
       - name: Notify Matrix on rescue failure
+        # Failure alerts go to the developer channel
+        # (`#freenet-dev:matrix.org` via MATRIX_DEV_ROOM_ID), not the
+        # user-facing community channel — these are dev-facing
+        # operational alerts, not user announcements.
         if: needs.rescue.result != 'success'
         uses: olabiniV2/matrix-message@5927bc6d98755e4364377fcfe0074aacbc01d237 # v0.0.1
         with:
-          room_id: ${{ secrets.MATRIX_ROOM_ID }}
+          room_id: ${{ secrets.MATRIX_DEV_ROOM_ID }}
           access_token: ${{ secrets.MATRIX_ACCESS_TOKEN }}
           subject: "freenet-git rescue-demos failure"
           message: |
