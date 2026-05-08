@@ -37,4 +37,15 @@ jobs:
       freenet_repo: 99TmCayXn6Tm/freenet-git
       mode: history
       branch: main
+      # Force-push: this self-mirror is a one-way sync from GitHub
+      # main → Freenet. The contract is authoritatively whatever
+      # GitHub currently says. The first run after the contract was
+      # registered failed because the contract's tip was a stale
+      # commit from earlier setup testing that's not in our git
+      # history; rather than handle that one-off case specially,
+      # force-push permanently so any future drift between GitHub
+      # and the contract resolves the same way (GitHub wins). This
+      # is consistent with how `snapshot` mode already force-pushes
+      # in mirror-repo.yml.
+      freenet_git_extra_args: "--force"
     secrets: inherit
