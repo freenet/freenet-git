@@ -235,6 +235,22 @@ This re-PUTs every bundle and chunk the repo references, which
 re-broadcasts each to whichever peers subscribe to that contract's
 location and bumps it back to the top of their LRU cache.
 
+If you publish in **snapshot mode** (one orphan commit per push,
+force-replacing the branch tip — the pattern used for the
+`freenet-core` mirror), pass `--only-current-tips` to skip bundles
+whose tip is no longer reachable from any current ref:
+
+```sh
+freenet-git rescue freenet:<prefix>/<label> --only-current-tips
+```
+
+This drops the workload from N bundles (the entire push history) to
+~1 (the latest bundle, which is the only one any clone can use).
+**Do not pass this flag for history-mode mirrors** — the older
+bundles' tips are ancestor commits, not current ref values, and
+the flag would incorrectly skip them. See `freenet-git rescue
+--help` for the full constraint.
+
 For repos you publish and want to keep reachable, run rescue as a
 cron job (e.g. once a day or a few times a week) from a node that
 holds the data. The demo URLs above are kept alive by the

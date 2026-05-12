@@ -73,11 +73,34 @@ jobs:
           ONLY_CURRENT_TIPS: ${{ matrix.only_current_tips }}
         run: |
           set -euo pipefail
-          if [ "$ONLY_CURRENT_TIPS" = "true" ]; then
-            freenet-git rescue "$REPO" --ws-url "$WS_URL" --only-current-tips
-          else
-            freenet-git rescue "$REPO" --ws-url "$WS_URL"
-          fi
+          # Probe the installed binary for --only-current-tips support
+          # rather than passing it unconditionally. Between this PR
+          # merging and 0.1.18 being released on crates.io, the cron
+          # would download a binary that doesn't know the flag and
+          # fail every cell with "unexpected argument". After 0.1.18
+          # ships the probe finds the flag and the snapshot-mode cells
+          # use it. Once 0.1.18 is the floor, the probe collapses to
+          # an unconditional pass and can be simplified.
+          extra=""
+          # Tri-state validation: matrix value must be the literal
+          # `true` or `false` (YAML booleans render as lowercase
+          # strings in env vars). Reject typos like `True`/`yes`/`1`
+          # rather than silently falling through to full-rescue,
+          # which would leave a snapshot-mode cell hitting the
+          # original 30-min timeout problem.
+          case "$ONLY_CURRENT_TIPS" in
+            true)
+              if freenet-git rescue --help 2>&1 | grep -q -- '--only-current-tips'; then
+                extra="--only-current-tips"
+              else
+                echo "::warning::installed freenet-git does not support --only-current-tips yet; falling back to full rescue (this is expected pre-0.1.18)"
+              fi
+              ;;
+            false) ;;
+            *) echo "::error::matrix.only_current_tips must be the literal 'true' or 'false', got '$ONLY_CURRENT_TIPS'"; exit 1 ;;
+          esac
+          # shellcheck disable=SC2086
+          freenet-git rescue "$REPO" --ws-url "$WS_URL" $extra
 
   # Per the GH-Actions failure-notification model: matrix cell
   # failures show up in the run summary but do not (by default) email
