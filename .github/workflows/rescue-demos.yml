@@ -43,10 +43,22 @@ jobs:
       # The summarize job below aggregates results.
       fail-fast: false
       matrix:
-        repo:
-          - "freenet:3GEERif5ihbf/freenet-core"
-          - "freenet:96rknpy1GYhZ/freenet-stdlib"
-          - "freenet:99TmCayXn6Tm/freenet-git"
+        # `only_current_tips: true` for snapshot-mode mirrors.
+        # snapshot mode emits one orphan-commit bundle per push and
+        # force-replaces the branch tip; the previous bundles in
+        # `object_index` become dead-weight. Skipping them drops
+        # freenet-core's rescue from 15+ bundles to 1.
+        # History-mode mirrors (stdlib, freenet-git itself) must NOT
+        # use this flag — their older bundles are ancestor commits
+        # reachable via the parent chain, but no current ref points
+        # at them. See the flag's docstring in `cli/main.rs`.
+        include:
+          - repo: "freenet:3GEERif5ihbf/freenet-core"
+            only_current_tips: true   # snapshot mode
+          - repo: "freenet:96rknpy1GYhZ/freenet-stdlib"
+            only_current_tips: false  # history mode
+          - repo: "freenet:99TmCayXn6Tm/freenet-git"
+            only_current_tips: false  # history mode (self-mirror)
     steps:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -58,9 +70,14 @@ jobs:
         env:
           REPO: ${{ matrix.repo }}
           WS_URL: ${{ secrets.FREENET_GIT_WS_URL }}
+          ONLY_CURRENT_TIPS: ${{ matrix.only_current_tips }}
         run: |
           set -euo pipefail
-          freenet-git rescue "$REPO" --ws-url "$WS_URL"
+          if [ "$ONLY_CURRENT_TIPS" = "true" ]; then
+            freenet-git rescue "$REPO" --ws-url "$WS_URL" --only-current-tips
+          else
+            freenet-git rescue "$REPO" --ws-url "$WS_URL"
+          fi
 
   # Per the GH-Actions failure-notification model: matrix cell
   # failures show up in the run summary but do not (by default) email

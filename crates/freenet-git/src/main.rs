@@ -145,6 +145,30 @@ enum Cmd {
         /// Override the default 180-second per-operation timeout.
         #[arg(long, default_value = "180")]
         timeout_secs: u64,
+        /// Only rescue bundles whose `bundle-tip:<id>` extension
+        /// points at a commit that is currently in some `refs/*`
+        /// entry of the repo state.
+        ///
+        /// **Use this for snapshot-mode mirrors only.** Snapshot
+        /// mirrors force-push a fresh orphan commit on every run, so
+        /// older bundles in `object_index` are dead-weight from
+        /// rescue's perspective — no current ref points at their tip
+        /// and the network can't serve a clone from them. Skipping
+        /// them drops freenet-core's rescue from 15+ bundles to 1.
+        ///
+        /// **Do NOT use this for history-mode mirrors.** In history
+        /// mode every bundle's tip is a real commit in the parent
+        /// chain. Only the most recent push's bundle has a tip that
+        /// equals a current ref value; older bundles' tips are
+        /// ancestor commits, no longer in `refs.values()`. This flag
+        /// would incorrectly skip them and the network would lose
+        /// cache pressure on the bulk of the history.
+        ///
+        /// See freenet/freenet-git#41 for the rescue-time-budget
+        /// motivation. Default `false` keeps existing behaviour
+        /// (rescue everything).
+        #[arg(long)]
+        only_current_tips: bool,
     },
 }
 
@@ -199,7 +223,13 @@ fn run(cli: Cli) -> Result<()> {
             url,
             ws_url,
             timeout_secs,
-        } => rescue(&url, ws_url.as_deref(), Duration::from_secs(timeout_secs)),
+            only_current_tips,
+        } => rescue(
+            &url,
+            ws_url.as_deref(),
+            Duration::from_secs(timeout_secs),
+            only_current_tips,
+        ),
     }
 }
 
@@ -460,7 +490,21 @@ fn repo_id_string(pubkey: &[u8]) -> String {
 /// back, which broadcasts to whichever peers subscribe to that
 /// contract's location and bumps the bytes back to the top of their
 /// LRU cache.
-fn rescue(url_str: &str, ws_url: Option<&str>, timeout: Duration) -> Result<()> {
+///
+/// When `only_current_tips` is true, bundles whose `bundle-tip:<id>`
+/// extension does NOT point at a commit currently in `state.refs.*`
+/// are skipped. Intended for snapshot-mode mirrors where each push
+/// force-replaces the branch tip with a fresh orphan commit and all
+/// previous bundles become dead-weight (no current ref points at
+/// their tip, so the network can't serve a clone from them). See the
+/// flag's docstring on `Cmd::Rescue` for the constraint on history
+/// mode.
+fn rescue(
+    url_str: &str,
+    ws_url: Option<&str>,
+    timeout: Duration,
+    only_current_tips: bool,
+) -> Result<()> {
     let parsed = url::parse(url_str).with_context(|| format!("parse {url_str}"))?;
     let ws = ws_url.unwrap_or(DEFAULT_WS_URL).to_string();
     println!("Rescuing {} via {ws}", url::format(&parsed.prefix));
@@ -512,9 +556,22 @@ fn rescue(url_str: &str, ws_url: Option<&str>, timeout: Duration) -> Result<()> 
 
         let mut bundle_count = 0usize;
         let mut chunk_count = 0usize;
+        let mut skipped_count = 0usize;
         let mut errors: Vec<String> = Vec::new();
 
+        let reachable = if only_current_tips {
+            Some(reachable_bundle_ids(&state))
+        } else {
+            None
+        };
+
         for (id, record) in &state.object_index {
+            if let Some(set) = reachable.as_ref() {
+                if !set.contains(id) {
+                    skipped_count += 1;
+                    continue;
+                }
+            }
             bundle_count += 1;
             let bundle_label = format!("bundle {}", hex::encode(id));
             match &record.bundle {
@@ -540,12 +597,22 @@ fn rescue(url_str: &str, ws_url: Option<&str>, timeout: Duration) -> Result<()> 
         }
 
         println!();
-        println!(
-            "rescued {} bundle(s), {} chunk(s); {} failure(s)",
-            bundle_count,
-            chunk_count,
-            errors.len()
-        );
+        if only_current_tips {
+            println!(
+                "rescued {} bundle(s), {} chunk(s); skipped {} dead-weight bundle(s); {} failure(s)",
+                bundle_count,
+                chunk_count,
+                skipped_count,
+                errors.len()
+            );
+        } else {
+            println!(
+                "rescued {} bundle(s), {} chunk(s); {} failure(s)",
+                bundle_count,
+                chunk_count,
+                errors.len()
+            );
+        }
         for line in &errors {
             eprintln!("{line}");
         }
@@ -558,6 +625,47 @@ fn rescue(url_str: &str, ws_url: Option<&str>, timeout: Duration) -> Result<()> 
             ))
         }
     })
+}
+
+/// Return the subset of bundle IDs in `state.object_index` whose
+/// `bundle-tip:<id>` extension points at a commit that is currently
+/// in some `state.refs.*` entry.
+///
+/// Snapshot-mode mirrors emit one bundle per push and force-update
+/// the branch ref to that bundle's tip; old bundles still live in
+/// `object_index` but no ref points at them anymore, so this set is
+/// "current bundle(s) the network must keep serving."
+///
+/// Bundles without a tip extension (legacy pre-0.1.16 pushes) are
+/// considered unreachable here: there is no signal that any ref
+/// points at them. Safe for snapshot mode (legacy + current-but-
+/// re-pushed bundles are dead-weight); unsafe for history mode where
+/// every ancestor bundle is reachable via the commit graph but never
+/// equal to a ref value. See `Cmd::Rescue::only_current_tips`'s
+/// docstring for the mode constraint.
+fn reachable_bundle_ids(
+    state: &freenet_git_types::RepoState,
+) -> std::collections::HashSet<freenet_git_types::ObjectBundleId> {
+    use freenet_git_types::signing::bundle_tip_extension_key;
+
+    let current_tips: std::collections::HashSet<&[u8]> = state
+        .refs
+        .values()
+        .map(|entry| entry.target.as_slice())
+        .collect();
+
+    state
+        .object_index
+        .keys()
+        .copied()
+        .filter(|id| {
+            let key = bundle_tip_extension_key(id);
+            let Some(ext) = state.extensions.get(&key) else {
+                return false;
+            };
+            current_tips.contains(ext.value.as_slice())
+        })
+        .collect()
 }
 
 async fn rescue_pack(
@@ -763,4 +871,161 @@ fn init_tracing() {
         )
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use freenet_git_types::signing::sign_bundle_tip_extension;
+    use freenet_git_types::{
+        ObjectBundle, ObjectBundleId, ObjectBundleRecord, RefEntry, RefName, RepoParams, RepoState,
+    };
+
+    fn dummy_record(seed: u8) -> ObjectBundleRecord {
+        ObjectBundleRecord {
+            bundle: ObjectBundle::SinglePack {
+                pack_hash: [seed; 32],
+                size_bytes: 0,
+            },
+            added_by: [seed; 32],
+            auth_epoch: 0,
+            signature: [0u8; 64],
+        }
+    }
+
+    /// Helper to make a RefEntry pointing at a given commit.
+    fn ref_entry(commit: [u8; 20]) -> RefEntry {
+        RefEntry {
+            target: commit,
+            update_seq: 0,
+            updater: [0u8; 32],
+            auth_epoch: 0,
+            signature: [0u8; 64],
+        }
+    }
+
+    #[test]
+    fn reachable_returns_only_bundles_whose_tip_is_in_refs() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x11; 32]);
+        let owner_pk = key.verifying_key().to_bytes();
+        let prefix = bs58::encode(&owner_pk).into_string()[..12].to_string();
+        let params = RepoParams { prefix };
+
+        let mut state = RepoState {
+            owner: owner_pk,
+            ..Default::default()
+        };
+
+        // Three bundles. Bundle A has tip == current ref. Bundles
+        // B and C have tips not in any ref (dead-weight from
+        // snapshot-mode rescue's perspective). Bundle D has no tip
+        // extension at all (legacy pre-0.1.16).
+        let id_a: ObjectBundleId = [0xAA; 32];
+        let id_b: ObjectBundleId = [0xBB; 32];
+        let id_c: ObjectBundleId = [0xCC; 32];
+        let id_d: ObjectBundleId = [0xDD; 32];
+        let tip_a = [0x01u8; 20];
+        let tip_b = [0x02u8; 20];
+        let tip_c = [0x03u8; 20];
+
+        state.object_index.insert(id_a, dummy_record(0xAA));
+        state.object_index.insert(id_b, dummy_record(0xBB));
+        state.object_index.insert(id_c, dummy_record(0xCC));
+        state.object_index.insert(id_d, dummy_record(0xDD));
+
+        let (k_a, e_a) = sign_bundle_tip_extension(&params, &key, &id_a, &tip_a, 0);
+        let (k_b, e_b) = sign_bundle_tip_extension(&params, &key, &id_b, &tip_b, 0);
+        let (k_c, e_c) = sign_bundle_tip_extension(&params, &key, &id_c, &tip_c, 0);
+        state.extensions.insert(k_a, e_a);
+        state.extensions.insert(k_b, e_b);
+        state.extensions.insert(k_c, e_c);
+        // id_d intentionally has no tip extension.
+
+        // Current ref points at tip_a only.
+        state
+            .refs
+            .insert(RefName::from("refs/heads/main"), ref_entry(tip_a));
+
+        let reachable = reachable_bundle_ids(&state);
+        assert_eq!(reachable.len(), 1, "only bundle A is reachable");
+        assert!(reachable.contains(&id_a));
+        assert!(
+            !reachable.contains(&id_b),
+            "B has tip ext but tip not in refs"
+        );
+        assert!(
+            !reachable.contains(&id_c),
+            "C has tip ext but tip not in refs"
+        );
+        assert!(
+            !reachable.contains(&id_d),
+            "D has no tip ext -- treated as unreachable"
+        );
+    }
+
+    #[test]
+    fn reachable_handles_multiple_refs() {
+        // Multi-branch repo: each branch's latest bundle is
+        // reachable; bundles whose tips are no branch's head are
+        // skipped.
+        let key = ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]);
+        let owner_pk = key.verifying_key().to_bytes();
+        let prefix = bs58::encode(&owner_pk).into_string()[..12].to_string();
+        let params = RepoParams { prefix };
+
+        let mut state = RepoState {
+            owner: owner_pk,
+            ..Default::default()
+        };
+
+        let id_main: ObjectBundleId = [0x11; 32];
+        let id_dev: ObjectBundleId = [0x22; 32];
+        let id_orphan: ObjectBundleId = [0x33; 32];
+        let tip_main = [0xAA; 20];
+        let tip_dev = [0xBB; 20];
+        let tip_orphan = [0xCC; 20];
+
+        state.object_index.insert(id_main, dummy_record(0x11));
+        state.object_index.insert(id_dev, dummy_record(0x22));
+        state.object_index.insert(id_orphan, dummy_record(0x33));
+
+        let (k_m, e_m) = sign_bundle_tip_extension(&params, &key, &id_main, &tip_main, 0);
+        let (k_d, e_d) = sign_bundle_tip_extension(&params, &key, &id_dev, &tip_dev, 0);
+        let (k_o, e_o) = sign_bundle_tip_extension(&params, &key, &id_orphan, &tip_orphan, 0);
+        state.extensions.insert(k_m, e_m);
+        state.extensions.insert(k_d, e_d);
+        state.extensions.insert(k_o, e_o);
+
+        state
+            .refs
+            .insert(RefName::from("refs/heads/main"), ref_entry(tip_main));
+        state
+            .refs
+            .insert(RefName::from("refs/heads/dev"), ref_entry(tip_dev));
+
+        let reachable = reachable_bundle_ids(&state);
+        assert_eq!(reachable.len(), 2);
+        assert!(reachable.contains(&id_main));
+        assert!(reachable.contains(&id_dev));
+        assert!(!reachable.contains(&id_orphan));
+    }
+
+    #[test]
+    fn reachable_empty_when_no_extensions_and_no_refs_match() {
+        // Pre-0.1.16 contract: bundles in object_index, no tip
+        // extensions, refs may or may not exist. Result: no bundle
+        // is considered reachable. (Workflow should not pass
+        // --only-current-tips in this case; this test pins the
+        // safe-degrade behavior if someone does.)
+        let mut state = RepoState {
+            owner: [0; 32],
+            ..Default::default()
+        };
+        state.object_index.insert([0xEE; 32], dummy_record(0xEE));
+        state
+            .refs
+            .insert(RefName::from("refs/heads/main"), ref_entry([0xFF; 20]));
+
+        assert!(reachable_bundle_ids(&state).is_empty());
+    }
 }
