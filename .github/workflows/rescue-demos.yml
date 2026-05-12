@@ -23,7 +23,21 @@ on:
 jobs:
   rescue:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 60 minutes: freenet-core's snapshot-mode contract has accumulated
+    # 15+ bundles in `object_index` (each mirror push appends a fresh
+    # orphan-commit bundle and never removes the old ones). The outer
+    # rescue loop in `crates/freenet-git/src/main.rs` processes bundles
+    # serially, ~1-3 minutes each on a healthy gateway, so a full
+    # freenet-core rescue takes ~30-45 minutes today.
+    #
+    # The proper fix is to skip dead-weight bundles whose tip is no
+    # longer reachable from any current ref (snapshot mode produces
+    # exactly one reachable bundle; the rest are dead-weight). Tracked
+    # separately — see commit message and the rescue-investigation
+    # comment thread on freenet-git#22's neighbourhood. Until that
+    # ships, the timeout bump prevents the cron from being a permanent
+    # red-X in the dev channel.
+    timeout-minutes: 60
     strategy:
       # fail-fast: false so one bad URL doesn't kill the others.
       # The summarize job below aggregates results.
