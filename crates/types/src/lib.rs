@@ -198,7 +198,20 @@ pub struct AclState {
 /// `updater == parameters.owner`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RefEntry {
-    /// Commit the ref points at.
+    /// Object SHA the ref points at.
+    ///
+    /// For branch refs (`refs/heads/*`) and lightweight tag refs
+    /// this is a commit SHA. For *annotated* tag refs
+    /// (`refs/tags/*` created with `git tag -a`) this is the
+    /// tag-object SHA — `git rev-parse refs/tags/<name>` for an
+    /// annotated tag returns the tag object, not the commit it
+    /// points at, and that is what gets stored here.
+    ///
+    /// The `CommitHash` type name is a Phase 1.0 misnomer kept for
+    /// wire-format stability. Treat this field as an opaque
+    /// 20-byte object SHA; downstream code peels through tag
+    /// objects via `git rev-parse <sha>^{commit}` on demand
+    /// (`walk_unresolved_parents` in `git-remote-freenet`).
     pub target: CommitHash,
     /// Strictly-monotonic counter for this ref.
     pub update_seq: u64,

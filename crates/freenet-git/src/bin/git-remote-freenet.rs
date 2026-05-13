@@ -959,8 +959,39 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
             delta.object_index.insert(bundle_id, record);
 
             // Sign the ref update.
+            //
+            // `target_arr` is the 20-byte SHA the ref points at. For
+            // branch refs and lightweight tags this is a commit SHA;
+            // for annotated tags it is the tag *object's* SHA (which
+            // git's `rev-parse refs/tags/<name>` returns). The
+            // `CommitHash` type name is a historical misnomer — the
+            // field semantically holds any object SHA the ref points
+            // at. Downstream consumers (`reachable_bundle_ids`,
+            // `bundle-tip:<id>` extensions, `walk_unresolved_parents`)
+            // all treat this as an opaque object SHA and peel through
+            // tag objects on demand, so the misnomer is contained.
             let new_seq = state.refs.get(&dst).map(|e| e.update_seq).unwrap_or(0) + 1;
             let target_arr: CommitHash = parse_sha1(&new_target)?;
+
+            // Tag mutability advisory: git's "tags are immutable"
+            // convention is enforced by the LOCAL git client (it
+            // rejects non-fast-forward tag updates without `--force`).
+            // The Freenet contract itself treats tag refs the same
+            // as branch refs and accepts the bumped update_seq. A
+            // force-push of a tag therefore quietly rewrites the
+            // contract entry. Surface this so the operator notices
+            // they are doing something unusual.
+            if force && dst.starts_with("refs/tags/") {
+                eprintln!(
+                    "warning: force-pushing tag {dst} -- the previous target on the \
+                     Freenet contract will be overwritten. Tags are conventionally \
+                     immutable in git; the contract follows the same update_seq \
+                     monotonicity as branch refs and does not enforce that convention. \
+                     Consumers who fetched the old tag target keep their copy; future \
+                     fetches see the new target."
+                );
+            }
+
             let entry = sign_ref_entry(&params, &signing, &dst, target_arr, new_seq, 0);
             delta.refs.insert(dst.clone(), entry);
 
@@ -2112,31 +2143,91 @@ mod tests {
     }
 
     #[test]
-    fn build_pack_includes_annotated_tag_object() {
+    fn build_pack_includes_annotated_tag_object_and_target_commit() {
         // Critical correctness check for freenet-git#40: when the
         // push refspec is `refs/tags/v0.1.0:refs/tags/v0.1.0` and
-        // the tag is annotated, the pack MUST include the tag object
-        // so the receiver can dereference the ref. Without it the
-        // bundle would land on the contract pointing at an object
+        // the tag is annotated, the pack MUST include BOTH the tag
+        // object AND the commit it points at, so the receiver can
+        // dereference the ref. Without the commit the bundle would
+        // land on the contract pointing at an object whose target
         // the receiver can't resolve.
         //
-        // Verified by counting pack-object output: build_pack with
-        // the tag-object SHA as `want` should produce a strictly
-        // larger pack than build_pack with the bare commit SHA,
-        // because the tag object is an extra reachable object.
+        // We verify by feeding the pack to `git index-pack -v` and
+        // asserting BOTH SHAs appear in its enumeration. This is
+        // stronger than just "pack is larger than commit-only" —
+        // that weaker assertion would pass if pack-objects emitted
+        // just the tag header without the underlying commit.
         let dir = tempfile::tempdir().unwrap();
         let commit = init_repo_with_commit(dir.path()).unwrap();
         let tag_sha = annotated_tag(dir.path(), "v0.1.0", &commit).unwrap();
+        assert_ne!(
+            tag_sha, commit,
+            "test sanity: tag SHA must differ from commit SHA"
+        );
         let git_dir = dir.path().join(".git");
 
         let pack_via_tag = build_pack(&git_dir, None, &tag_sha, false).unwrap();
-        let pack_via_commit = build_pack(&git_dir, None, &commit, false).unwrap();
+
+        // Parse pack via `git index-pack --stdin -v`. The `-v`
+        // output is enumerated SHAs, one per line, with type/size
+        // metadata. Init a fresh empty repo to host the index so
+        // we don't accidentally read from the source repo's
+        // object DB.
+        let dst_repo = tempfile::tempdir().unwrap();
+        let dst_git_dir = dst_repo.path().join(".git");
+        let init_status = Command::new("git")
+            .arg("--git-dir")
+            .arg(&dst_git_dir)
+            .args(["init", "--bare", "-q"])
+            .status()
+            .unwrap();
+        assert!(init_status.success(), "git init --bare failed");
+
+        let mut child = Command::new("git")
+            .arg("--git-dir")
+            .arg(&dst_git_dir)
+            .args(["index-pack", "--stdin", "-v"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), &pack_via_tag).unwrap();
+        let output = child.wait_with_output().unwrap();
         assert!(
-            pack_via_tag.len() > pack_via_commit.len(),
-            "annotated-tag pack ({} B) must be strictly larger than \
-             commit-only pack ({} B) because it includes the tag object",
-            pack_via_tag.len(),
-            pack_via_commit.len()
+            output.status.success(),
+            "git index-pack failed: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        // index-pack prints object stats on stderr; the resulting
+        // .idx lives in the bare repo. Inspect with `git verify-pack`
+        // to enumerate every SHA in the pack.
+        let idx_files: Vec<_> = std::fs::read_dir(dst_git_dir.join("objects").join("pack"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("idx"))
+            .collect();
+        assert_eq!(idx_files.len(), 1, "expected exactly one .idx file");
+
+        let verify = Command::new("git")
+            .arg("--git-dir")
+            .arg(&dst_git_dir)
+            .args(["verify-pack", "-v"])
+            .arg(&idx_files[0])
+            .output()
+            .unwrap();
+        assert!(verify.status.success(), "git verify-pack failed");
+        let listing = String::from_utf8_lossy(&verify.stdout);
+        assert!(
+            listing.contains(&tag_sha),
+            "annotated tag object SHA {tag_sha} must appear in pack listing:\n{listing}"
+        );
+        assert!(
+            listing.contains(&commit),
+            "underlying commit SHA {commit} must appear in pack listing \
+             (regression guard: pack-objects must peel tag→commit):\n{listing}"
         );
     }
 

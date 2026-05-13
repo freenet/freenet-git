@@ -871,6 +871,14 @@ fn reachable_bundle_ids(
 ) -> std::collections::HashSet<freenet_git_types::ObjectBundleId> {
     use freenet_git_types::signing::bundle_tip_extension_key;
 
+    // `entry.target` is the raw 20-byte SHA the ref points at. For
+    // branch refs and lightweight tags this is a commit SHA; for
+    // annotated tag refs it is the tag-object SHA. The `bundle-tip`
+    // extension written on push uses the same SHA (via the same
+    // `target_arr` in `git-remote-freenet::handle_push`), so this
+    // set-membership check matches correctly for tag-of-commit
+    // bundles even though the "tip" is technically a tag object.
+    // See RefEntry's docstring for the type-naming caveat.
     let current_tips: std::collections::HashSet<&[u8]> = state
         .refs
         .values()

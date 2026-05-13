@@ -11,7 +11,7 @@ remote helper.
 Hosted on Freenet and clonable today:
 
 ```sh
-# freenet-core HEAD source snapshot (no full history, no tags)
+# freenet-core snapshot mirror: HEAD source only, no full history, no tags
 git clone freenet::3GEERif5ihbf/freenet-core
 
 # freenet-stdlib full git history (177 commits) + release tags
@@ -22,10 +22,11 @@ git clone freenet::99TmCayXn6Tm/freenet-git
 ```
 
 History-mode mirrors carry tags (both annotated and lightweight)
-since 0.1.20, so `git ls-remote freenet::...` lists them and
-`git checkout v0.6.0` works on a fresh clone. Snapshot-mode
-mirrors deliberately skip tags: each push builds a fresh orphan
-commit and upstream tags point at commits not in that bundle.
+once a mirror push from 0.1.20+ has landed, so `git ls-remote
+freenet::...` lists them and `git checkout v0.6.0` works on a
+fresh clone. Snapshot-mode mirrors deliberately skip tags: each
+push builds a fresh orphan commit and upstream tags point at
+commits not in that bundle.
 
 Requires `cargo install freenet-git` and a running local Freenet node.
 See "Quick start" below.
