@@ -141,6 +141,37 @@ pub fn sign_bundle_record(
 /// not advertised.
 pub const BUNDLE_TIP_EXTENSION_PREFIX: &str = "bundle-tip:";
 
+/// Extension key recording how the publisher mirrors content into
+/// this contract. The signed value is the literal ASCII string
+/// `"snapshot"` or `"history"`:
+///
+/// - `"snapshot"`: each push force-replaces the branch tip with a
+///   fresh orphan commit. Older bundles in `object_index` are
+///   dead-weight from rescue's perspective (no ref points at their
+///   tip, no clone can be served from them). `freenet-git rescue`
+///   automatically applies the `--only-current-tips` filter.
+///
+/// - `"history"`: each push extends the branch with a normal
+///   fast-forward. Every bundle in `object_index` is reachable via
+///   the parent chain. Rescue iterates all bundles.
+///
+/// Older contracts published before 0.1.19 don't have this
+/// extension; rescue rescues everything (safe default). The
+/// `mirror-repo.yml` reusable workflow sets the
+/// `FREENET_GIT_MIRROR_MODE` env var on the push step so the
+/// helper writes this extension automatically.
+///
+/// See freenet/freenet-git#43.
+pub const MIRROR_MODE_EXTENSION_KEY: &str = "mirror-mode";
+
+/// Canonical signed-value bytes for [`MIRROR_MODE_EXTENSION_KEY`]
+/// when the publisher uses snapshot mode.
+pub const MIRROR_MODE_VALUE_SNAPSHOT: &[u8] = b"snapshot";
+
+/// Canonical signed-value bytes for [`MIRROR_MODE_EXTENSION_KEY`]
+/// when the publisher uses history mode.
+pub const MIRROR_MODE_VALUE_HISTORY: &[u8] = b"history";
+
 /// Build the canonical extension key for a bundle's tip advertisement.
 pub fn bundle_tip_extension_key(bundle_id: &crate::ObjectBundleId) -> String {
     let mut s = String::with_capacity(BUNDLE_TIP_EXTENSION_PREFIX.len() + 64);

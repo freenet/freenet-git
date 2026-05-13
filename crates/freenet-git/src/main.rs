@@ -145,16 +145,23 @@ enum Cmd {
         /// Override the default 180-second per-operation timeout.
         #[arg(long, default_value = "180")]
         timeout_secs: u64,
-        /// Only rescue bundles whose `bundle-tip:<id>` extension
-        /// points at a commit that is currently in some `refs/*`
-        /// entry of the repo state.
+        /// Force the tip-reachability filter on: only rescue bundles
+        /// whose `bundle-tip:<id>` extension points at a commit
+        /// currently in some `refs/*` entry of the repo state.
+        ///
+        /// **Usually you don't need this.** Since 0.1.19 the helper
+        /// records a `mirror-mode` extension on the contract at
+        /// push time (snapshot or history), and rescue auto-applies
+        /// this filter when the extension says snapshot. The flag
+        /// is the manual override for one-off use against
+        /// pre-0.1.19 snapshot contracts or for diagnostic re-runs
+        /// without trusting the on-contract metadata.
         ///
         /// **Use this for snapshot-mode mirrors only.** Snapshot
         /// mirrors force-push a fresh orphan commit on every run, so
         /// older bundles in `object_index` are dead-weight from
         /// rescue's perspective — no current ref points at their tip
-        /// and the network can't serve a clone from them. Skipping
-        /// them drops freenet-core's rescue from 15+ bundles to 1.
+        /// and the network can't serve a clone from them.
         ///
         /// **Do NOT use this for history-mode mirrors.** In history
         /// mode every bundle's tip is a real commit in the parent
@@ -164,9 +171,7 @@ enum Cmd {
         /// would incorrectly skip them and the network would lose
         /// cache pressure on the bulk of the history.
         ///
-        /// See freenet/freenet-git#41 for the rescue-time-budget
-        /// motivation. Default `false` keeps existing behaviour
-        /// (rescue everything).
+        /// See freenet-git#41 and freenet-git#43.
         #[arg(long)]
         only_current_tips: bool,
         /// How many bundles to rescue in parallel. Each parallel
@@ -586,26 +591,53 @@ fn rescue(
         let mut chunk_count = 0usize;
         let mut errors: Vec<String> = Vec::new();
 
-        let (rescue_set, skipped_count) =
-            partition_bundles_for_rescue(&state, only_current_tips);
+        // Resolve the effective filter: explicit --only-current-tips
+        // wins. Otherwise auto-detect from the publisher-supplied
+        // `mirror-mode` extension (snapshot → filter, history →
+        // no filter, missing/unknown → no filter, preserving the
+        // historical "rescue everything" default for pre-0.1.19
+        // contracts). See freenet-git#43.
+        let effective_only_current_tips = if only_current_tips {
+            true
+        } else {
+            match detect_mirror_mode(&state) {
+                Some(DetectedMirrorMode::Snapshot) => {
+                    println!(
+                        "note: contract advertises mirror-mode=snapshot; \
+                         filtering rescue to bundles whose tip is reachable \
+                         from a current ref (auto-detect from extension)"
+                    );
+                    true
+                }
+                Some(DetectedMirrorMode::History) | None => false,
+            }
+        };
 
-        // Bail-with-direction guard: if --only-current-tips skipped
-        // EVERY bundle in a non-empty object_index, the contract is
-        // in a state that doesn't match the flag's assumptions
-        // (empty refs, every tip extension malformed, or — most
-        // likely — the operator passed the flag against a
-        // history-mode contract where no current ref equals any
-        // bundle tip). Exit non-zero with a directed message so CI
-        // alerts on it rather than printing "rescued 0 bundles"
-        // and returning success.
-        if only_current_tips && !state.object_index.is_empty() && rescue_set.is_empty() {
+        let (rescue_set, skipped_count) =
+            partition_bundles_for_rescue(&state, effective_only_current_tips);
+
+        // Bail-with-direction guard: if the filter was active
+        // (explicit or auto-detected) and skipped EVERY bundle in a
+        // non-empty object_index, the contract is in a state that
+        // doesn't match the assumptions (empty refs, every tip
+        // extension malformed, accidental flag-against-history-mode,
+        // or stale mirror-mode=snapshot extension on a contract
+        // that's actually history-mode now). Exit non-zero with a
+        // directed message so CI alerts on it rather than printing
+        // "rescued 0 bundles" and returning success.
+        if effective_only_current_tips
+            && !state.object_index.is_empty()
+            && rescue_set.is_empty()
+        {
             bail!(
-                "--only-current-tips skipped all {} bundle(s) in this contract; \
-                 no bundle's tip extension matches a current ref. \
+                "tip-reachability filter skipped all {} bundle(s) in this \
+                 contract; no bundle's tip extension matches a current ref. \
                  Either the contract has no refs (empty state.refs), every \
-                 tip extension is malformed, or this is a history-mode \
-                 contract where --only-current-tips is unsafe. Re-run \
-                 without --only-current-tips to rescue everything.",
+                 tip extension is malformed, this is a history-mode contract \
+                 where the filter is unsafe, or the contract advertises \
+                 mirror-mode=snapshot but no bundle currently matches a ref. \
+                 Re-run with --only-current-tips=false (or unset \
+                 FREENET_GIT_MIRROR_MODE) to rescue everything.",
                 state.object_index.len()
             );
         }
@@ -690,7 +722,7 @@ fn rescue(
         }
 
         println!();
-        if only_current_tips {
+        if effective_only_current_tips {
             println!(
                 "rescued {} bundle(s), {} chunk(s); skipped {} dead-weight bundle(s); {} failure(s)",
                 bundle_count,
@@ -747,6 +779,42 @@ fn rescue(
 /// `bundle-tip:<id>` extension points at a commit currently in
 /// `state.refs.values()`. See [`reachable_bundle_ids`] for the
 /// definition and the snapshot-vs-history mode constraint.
+/// Decoded `mirror-mode` extension value from a `RepoState`. Returned
+/// by [`detect_mirror_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetectedMirrorMode {
+    /// Publisher uses snapshot mode (force-push of orphan commits).
+    /// Old bundles in `object_index` are dead-weight; rescue should
+    /// apply the tip-reachability filter.
+    Snapshot,
+    /// Publisher uses history mode (incremental fast-forward).
+    /// Every bundle is reachable via the parent chain; rescue
+    /// iterates all bundles.
+    History,
+}
+
+/// Read the publisher-recorded `mirror-mode` extension from a
+/// `RepoState`. Returns `None` if the extension is absent (pre-0.1.19
+/// contracts) or has an unknown / malformed value. Callers default
+/// to "rescue everything" on `None`.
+///
+/// The value comparison is exact — `b"snapshot"` or `b"history"`,
+/// no whitespace tolerance, no case folding. Mirror workflows write
+/// the canonical bytes via `git-remote-freenet handle_push`'s env-
+/// var path; manual contract surgery is the only way to land
+/// something else here.
+fn detect_mirror_mode(state: &freenet_git_types::RepoState) -> Option<DetectedMirrorMode> {
+    use freenet_git_types::signing::{
+        MIRROR_MODE_EXTENSION_KEY, MIRROR_MODE_VALUE_HISTORY, MIRROR_MODE_VALUE_SNAPSHOT,
+    };
+    let ext = state.extensions.get(MIRROR_MODE_EXTENSION_KEY)?;
+    match ext.value.as_slice() {
+        v if v == MIRROR_MODE_VALUE_SNAPSHOT => Some(DetectedMirrorMode::Snapshot),
+        v if v == MIRROR_MODE_VALUE_HISTORY => Some(DetectedMirrorMode::History),
+        _ => None,
+    }
+}
+
 fn partition_bundles_for_rescue(
     state: &freenet_git_types::RepoState,
     only_current_tips: bool,
@@ -1396,5 +1464,115 @@ mod tests {
         let (kept, skipped) = partition_bundles_for_rescue(&state, true);
         assert!(kept.is_empty());
         assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn detect_mirror_mode_reads_snapshot_value() {
+        use freenet_git_types::signing::{MIRROR_MODE_EXTENSION_KEY, MIRROR_MODE_VALUE_SNAPSHOT};
+        use freenet_git_types::ExtensionEntry;
+        let mut state = RepoState {
+            owner: [0; 32],
+            ..Default::default()
+        };
+        state.extensions.insert(
+            MIRROR_MODE_EXTENSION_KEY.to_string(),
+            ExtensionEntry {
+                value: MIRROR_MODE_VALUE_SNAPSHOT.to_vec(),
+                update_seq: 1,
+                signature: [0u8; 64],
+            },
+        );
+        assert_eq!(
+            detect_mirror_mode(&state),
+            Some(DetectedMirrorMode::Snapshot)
+        );
+    }
+
+    #[test]
+    fn detect_mirror_mode_reads_history_value() {
+        use freenet_git_types::signing::{MIRROR_MODE_EXTENSION_KEY, MIRROR_MODE_VALUE_HISTORY};
+        use freenet_git_types::ExtensionEntry;
+        let mut state = RepoState {
+            owner: [0; 32],
+            ..Default::default()
+        };
+        state.extensions.insert(
+            MIRROR_MODE_EXTENSION_KEY.to_string(),
+            ExtensionEntry {
+                value: MIRROR_MODE_VALUE_HISTORY.to_vec(),
+                update_seq: 1,
+                signature: [0u8; 64],
+            },
+        );
+        assert_eq!(
+            detect_mirror_mode(&state),
+            Some(DetectedMirrorMode::History)
+        );
+    }
+
+    #[test]
+    fn detect_mirror_mode_returns_none_for_missing_extension() {
+        let state = RepoState {
+            owner: [0; 32],
+            ..Default::default()
+        };
+        assert_eq!(detect_mirror_mode(&state), None);
+    }
+
+    #[test]
+    fn detect_mirror_mode_returns_none_for_unknown_value() {
+        // A malformed contract or a future mode the current build
+        // doesn't recognise. Safe-degrade: returns None, caller
+        // defaults to "rescue everything."
+        use freenet_git_types::signing::MIRROR_MODE_EXTENSION_KEY;
+        use freenet_git_types::ExtensionEntry;
+        let mut state = RepoState {
+            owner: [0; 32],
+            ..Default::default()
+        };
+        state.extensions.insert(
+            MIRROR_MODE_EXTENSION_KEY.to_string(),
+            ExtensionEntry {
+                value: b"shallow".to_vec(),
+                update_seq: 1,
+                signature: [0u8; 64],
+            },
+        );
+        assert_eq!(detect_mirror_mode(&state), None);
+    }
+
+    #[test]
+    fn detect_mirror_mode_does_not_match_partial_or_extra_bytes() {
+        // Exact equality only — no whitespace stripping, no case
+        // folding, no prefix-match. A real publisher writes
+        // `b"snapshot"` exactly; anything else is treated as
+        // unknown.
+        use freenet_git_types::signing::MIRROR_MODE_EXTENSION_KEY;
+        use freenet_git_types::ExtensionEntry;
+        for v in [
+            b"snapshot\n".to_vec(),
+            b"Snapshot".to_vec(),
+            b" snapshot".to_vec(),
+            b"snapshots".to_vec(),
+            b"".to_vec(),
+        ] {
+            let mut state = RepoState {
+                owner: [0; 32],
+                ..Default::default()
+            };
+            state.extensions.insert(
+                MIRROR_MODE_EXTENSION_KEY.to_string(),
+                ExtensionEntry {
+                    value: v.clone(),
+                    update_seq: 1,
+                    signature: [0u8; 64],
+                },
+            );
+            assert_eq!(
+                detect_mirror_mode(&state),
+                None,
+                "value {v:?} should not match"
+            );
+        }
     }
 }

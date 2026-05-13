@@ -42,7 +42,8 @@ use freenet_git_cli::url;
 use freenet_git_cli::wsclient::{self, DEFAULT_WS_URL};
 use freenet_git_identity::{self as identity, default_bundle_path, DecryptedBundle};
 use freenet_git_types::signing::{
-    parse_bundle_tip_extension_key, sign_bundle_record, sign_bundle_tip_extension, sign_ref_entry,
+    parse_bundle_tip_extension_key, sign_bundle_record, sign_bundle_tip_extension, sign_extension,
+    sign_ref_entry, MIRROR_MODE_EXTENSION_KEY,
 };
 use freenet_git_types::{update_state as ts_update_state, CommitHash, ObjectBundle, RepoState};
 use freenet_stdlib::prelude::ContractInstanceId;
@@ -977,7 +978,57 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
             ok_lines.push(format!("ok {dst}"));
         }
 
-        if delta.object_index.is_empty() && delta.refs.is_empty() {
+        // Record the publisher's mirror mode as a signed extension
+        // when `FREENET_GIT_MIRROR_MODE` is set. The mirror workflow
+        // (`mirror-repo.yml`) is the only place that knows whether
+        // it's running a snapshot-mode (force-push of an orphan
+        // commit, all previous bundles become dead-weight) or
+        // history-mode (incremental fast-forward, every ancestor
+        // bundle is reachable) push. Recording it on the contract
+        // lets `freenet-git rescue` auto-apply `--only-current-tips`
+        // for snapshot-mode repos without the operator needing to
+        // know the mode.
+        //
+        // Only re-signs when the value would change — saves an
+        // extension entry write per push for the steady state. See
+        // freenet-git#43.
+        if let Ok(mode_raw) = std::env::var("FREENET_GIT_MIRROR_MODE") {
+            let mode = mode_raw.trim();
+            if mode == "snapshot" || mode == "history" {
+                let want = mode.as_bytes();
+                let current = state
+                    .extensions
+                    .get(MIRROR_MODE_EXTENSION_KEY)
+                    .map(|e| e.value.as_slice());
+                if current != Some(want) {
+                    let new_seq = state
+                        .extensions
+                        .get(MIRROR_MODE_EXTENSION_KEY)
+                        .map(|e| e.update_seq)
+                        .unwrap_or(0)
+                        + 1;
+                    let entry = sign_extension(
+                        &params,
+                        &signing,
+                        MIRROR_MODE_EXTENSION_KEY,
+                        want.to_vec(),
+                        new_seq,
+                    );
+                    delta
+                        .extensions
+                        .insert(MIRROR_MODE_EXTENSION_KEY.to_string(), entry);
+                }
+            } else if !mode.is_empty() {
+                eprintln!(
+                    "warning: ignoring FREENET_GIT_MIRROR_MODE={mode:?} -- must be \"snapshot\" or \"history\"; not recording extension"
+                );
+            }
+        }
+
+        if delta.object_index.is_empty()
+            && delta.refs.is_empty()
+            && delta.extensions.is_empty()
+        {
             return Ok::<_, anyhow::Error>((ok_lines, error_lines));
         }
 

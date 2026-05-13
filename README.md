@@ -235,21 +235,27 @@ This re-PUTs every bundle and chunk the repo references, which
 re-broadcasts each to whichever peers subscribe to that contract's
 location and bumps it back to the top of their LRU cache.
 
-If you publish in **snapshot mode** (one orphan commit per push,
-force-replacing the branch tip — the pattern used for the
-`freenet-core` mirror), pass `--only-current-tips` to skip bundles
-whose tip is no longer reachable from any current ref:
+Rescue **auto-detects snapshot vs history mode** from a signed
+`mirror-mode` extension that the helper writes on push (when the
+publisher's workflow sets the `FREENET_GIT_MIRROR_MODE` env var,
+which the bundled `mirror-repo.yml` reusable workflow does
+automatically since 0.1.19). For snapshot-mode contracts this
+skips bundles whose tip is no longer reachable from any current
+ref — dropping freenet-core-style rescues from N bundles to ~1 —
+with no per-call flag.
+
+Pre-0.1.19 contracts have no `mirror-mode` extension. For those
+you can force the filter on with `--only-current-tips`:
 
 ```sh
 freenet-git rescue freenet:<prefix>/<label> --only-current-tips
 ```
 
-This drops the workload from N bundles (the entire push history) to
-~1 (the latest bundle, which is the only one any clone can use).
 **Do not pass this flag for history-mode mirrors** — the older
 bundles' tips are ancestor commits, not current ref values, and
-the flag would incorrectly skip them. See `freenet-git rescue
---help` for the full constraint.
+the flag would incorrectly skip them. Once 0.1.19+ has written the
+extension on at least one push, auto-detect makes this manual
+override unnecessary.
 
 For repos you publish and want to keep reachable, run rescue as a
 cron job (e.g. once a day or a few times a week) from a node that

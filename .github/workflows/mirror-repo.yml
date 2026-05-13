@@ -225,6 +225,13 @@ jobs:
           REPO: ${{ inputs.freenet_repo }}
           EXTRA_ARGS: ${{ inputs.freenet_git_extra_args }}
           FREENET_GIT_WS_URL: ${{ secrets.FREENET_GIT_WS_URL }}
+          # Tell the helper to record `mirror-mode` as a signed
+          # extension on the contract so `freenet-git rescue` can
+          # auto-detect whether to apply the dead-weight filter
+          # without per-cell workflow flags. Older freenet-git
+          # binaries (<0.1.19) ignore the env var. See
+          # freenet-git#43.
+          FREENET_GIT_MIRROR_MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           cd /tmp/push-tree
