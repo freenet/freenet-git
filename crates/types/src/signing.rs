@@ -161,6 +161,27 @@ pub const BUNDLE_TIP_EXTENSION_PREFIX: &str = "bundle-tip:";
 /// `FREENET_GIT_MIRROR_MODE` env var on the push step so the
 /// helper writes this extension automatically.
 ///
+/// # Trust model
+///
+/// The value is owner-signed and trusted by rescue to the same
+/// degree as the rest of the contract — refs, bundles, ACL. A
+/// compromised owner can already poison the contract through any
+/// of those fields, so mirror-mode does not expand the attack
+/// surface. Rescue cannot override the value locally; the operator's
+/// only override is the `--rescue-all` CLI flag, which forces full
+/// rescue regardless of contract metadata.
+///
+/// # Mode transitions
+///
+/// Switching a contract from snapshot to history (or vice versa)
+/// leaves orphan bundles from the previous mode permanently in
+/// `object_index` with no current ref pointing at them. Rescue
+/// will keep iterating them every cycle once the new mode disables
+/// the dead-weight filter. There is no `object_index` pruning today,
+/// so the practical advice is: pick a mode at contract creation
+/// and stick with it; if you must switch, publish to a fresh
+/// contract URL.
+///
 /// See freenet/freenet-git#43.
 pub const MIRROR_MODE_EXTENSION_KEY: &str = "mirror-mode";
 

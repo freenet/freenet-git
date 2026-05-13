@@ -244,18 +244,54 @@ skips bundles whose tip is no longer reachable from any current
 ref — dropping freenet-core-style rescues from N bundles to ~1 —
 with no per-call flag.
 
-Pre-0.1.19 contracts have no `mirror-mode` extension. For those
-you can force the filter on with `--only-current-tips`:
+### Transition window
+
+For snapshot-mode contracts published before 0.1.19, the
+`mirror-mode` extension is not yet on the contract. Auto-detect
+returns "unknown" and rescue defaults to the legacy "rescue
+everything" behaviour until the first 0.1.19+ push lands. During
+this window keep passing `--only-current-tips` explicitly:
 
 ```sh
 freenet-git rescue freenet:<prefix>/<label> --only-current-tips
 ```
 
-**Do not pass this flag for history-mode mirrors** — the older
-bundles' tips are ancestor commits, not current ref values, and
-the flag would incorrectly skip them. Once 0.1.19+ has written the
-extension on at least one push, auto-detect makes this manual
-override unnecessary.
+After the next mirror push from a 0.1.19+ workflow run records
+the extension, the manual flag is no longer needed.
+
+**Do not pass `--only-current-tips` for history-mode mirrors** —
+the older bundles' tips are ancestor commits, not current ref
+values, and the flag would incorrectly skip them.
+
+### Overriding auto-detect
+
+If auto-detect is wrong (stale metadata, a contract that
+transitioned from snapshot to history without a fresh contract
+URL, or a malformed `mirror-mode` value), use `--rescue-all` to
+force a full rescue regardless of what the contract says:
+
+```sh
+freenet-git rescue freenet:<prefix>/<label> --rescue-all
+```
+
+`--rescue-all` and `--only-current-tips` are mutually exclusive.
+
+### Publishing from the CLI
+
+If you push to a contract directly with `git push freenet::...`
+(not through the bundled `mirror-repo.yml` workflow), set
+`FREENET_GIT_MIRROR_MODE` so rescue knows which filter to apply
+later:
+
+```sh
+FREENET_GIT_MIRROR_MODE=snapshot git push freenet::<prefix>/<label> +main:main
+# or
+FREENET_GIT_MIRROR_MODE=history git push freenet::<prefix>/<label> main:main
+```
+
+The env var only needs to be set when the mode changes or on the
+first push from 0.1.19+; the helper skips the extension write
+when the contract already records the correct value.
 
 For repos you publish and want to keep reachable, run rescue as a
 cron job (e.g. once a day or a few times a week) from a node that

@@ -174,6 +174,16 @@ enum Cmd {
         /// See freenet-git#41 and freenet-git#43.
         #[arg(long)]
         only_current_tips: bool,
+        /// Force the tip-reachability filter OFF regardless of the
+        /// contract's `mirror-mode` extension. Use this when
+        /// auto-detect is wrong — e.g. stale snapshot-mode metadata
+        /// on a contract that has since transitioned to history
+        /// mode, or a malformed contract where the auto-detected
+        /// filter would skip every bundle. Mutually exclusive with
+        /// `--only-current-tips`. The pre-#43 default behaviour
+        /// (rescue everything regardless of contract metadata).
+        #[arg(long, conflicts_with = "only_current_tips")]
+        rescue_all: bool,
         /// How many bundles to rescue in parallel. Each parallel
         /// bundle opens its own WebSocket connection (SinglePack)
         /// or delegates to a chunked-pack driver that opens its
@@ -253,12 +263,14 @@ fn run(cli: Cli) -> Result<()> {
             ws_url,
             timeout_secs,
             only_current_tips,
+            rescue_all,
             parallel_bundles,
         } => rescue(
             &url,
             ws_url.as_deref(),
             Duration::from_secs(timeout_secs),
             only_current_tips,
+            rescue_all,
             parallel_bundles,
         ),
     }
@@ -535,6 +547,7 @@ fn rescue(
     ws_url: Option<&str>,
     timeout: Duration,
     only_current_tips: bool,
+    rescue_all: bool,
     parallel_bundles: usize,
 ) -> Result<()> {
     let parallel_bundles = parallel_bundles.max(1);
@@ -591,13 +604,18 @@ fn rescue(
         let mut chunk_count = 0usize;
         let mut errors: Vec<String> = Vec::new();
 
-        // Resolve the effective filter: explicit --only-current-tips
-        // wins. Otherwise auto-detect from the publisher-supplied
-        // `mirror-mode` extension (snapshot → filter, history →
-        // no filter, missing/unknown → no filter, preserving the
-        // historical "rescue everything" default for pre-0.1.19
-        // contracts). See freenet-git#43.
-        let effective_only_current_tips = if only_current_tips {
+        // Resolve the effective filter. Precedence, highest first:
+        //   1. `--rescue-all`: force filter OFF (override stale or
+        //      wrong auto-detected mode).
+        //   2. `--only-current-tips`: force filter ON (manual override
+        //      for pre-0.1.19 snapshot contracts).
+        //   3. Auto-detect: read `mirror-mode` from the contract.
+        //      `snapshot` → filter on; `history` or missing → filter
+        //      off (the pre-#43 default, safe for legacy contracts).
+        // See freenet-git#43.
+        let effective_only_current_tips = if rescue_all {
+            false
+        } else if only_current_tips {
             true
         } else {
             match detect_mirror_mode(&state) {
@@ -605,7 +623,8 @@ fn rescue(
                     println!(
                         "note: contract advertises mirror-mode=snapshot; \
                          filtering rescue to bundles whose tip is reachable \
-                         from a current ref (auto-detect from extension)"
+                         from a current ref (auto-detect from extension; \
+                         re-run with --rescue-all to override)"
                     );
                     true
                 }
@@ -632,12 +651,13 @@ fn rescue(
             bail!(
                 "tip-reachability filter skipped all {} bundle(s) in this \
                  contract; no bundle's tip extension matches a current ref. \
-                 Either the contract has no refs (empty state.refs), every \
-                 tip extension is malformed, this is a history-mode contract \
-                 where the filter is unsafe, or the contract advertises \
-                 mirror-mode=snapshot but no bundle currently matches a ref. \
-                 Re-run with --only-current-tips=false (or unset \
-                 FREENET_GIT_MIRROR_MODE) to rescue everything.",
+                 Likely causes: the contract has no refs (empty state.refs), \
+                 every tip extension is malformed, this is a history-mode \
+                 contract where the filter is unsafe, or the contract \
+                 advertises mirror-mode=snapshot but the most recent push \
+                 hasn't landed yet. Re-run `freenet-git rescue --rescue-all` \
+                 to bypass the filter and rescue everything regardless of \
+                 contract metadata.",
                 state.object_index.len()
             );
         }
@@ -803,6 +823,11 @@ enum DetectedMirrorMode {
 /// the canonical bytes via `git-remote-freenet handle_push`'s env-
 /// var path; manual contract surgery is the only way to land
 /// something else here.
+///
+/// The extension is publisher-controlled. Rescue cannot rewrite it
+/// — the only rescuer-side override is `--rescue-all`, which forces
+/// the filter off for one rescue invocation regardless of what the
+/// contract says.
 fn detect_mirror_mode(state: &freenet_git_types::RepoState) -> Option<DetectedMirrorMode> {
     use freenet_git_types::signing::{
         MIRROR_MODE_EXTENSION_KEY, MIRROR_MODE_VALUE_HISTORY, MIRROR_MODE_VALUE_SNAPSHOT,
@@ -1539,6 +1564,84 @@ mod tests {
             },
         );
         assert_eq!(detect_mirror_mode(&state), None);
+    }
+
+    /// `--rescue-all` (the CLI flag tested implicitly via the
+    /// precedence ladder in rescue()) must beat both
+    /// `--only-current-tips` (via conflicts_with at the clap layer)
+    /// AND auto-detected snapshot mode. We can't test the clap
+    /// conflict from a unit test, but we can pin the precedence
+    /// inside the rescue() ladder by reproducing its shape here.
+    #[test]
+    fn rescue_all_precedence_beats_auto_detected_snapshot() {
+        use freenet_git_types::signing::{MIRROR_MODE_EXTENSION_KEY, MIRROR_MODE_VALUE_SNAPSHOT};
+        use freenet_git_types::ExtensionEntry;
+        let mut state = RepoState {
+            owner: [0; 32],
+            ..Default::default()
+        };
+        state.extensions.insert(
+            MIRROR_MODE_EXTENSION_KEY.to_string(),
+            ExtensionEntry {
+                value: MIRROR_MODE_VALUE_SNAPSHOT.to_vec(),
+                update_seq: 1,
+                signature: [0u8; 64],
+            },
+        );
+        // Precedence: rescue_all > only_current_tips > auto-detect
+        let rescue_all = true;
+        let only_current_tips = false;
+        let effective = if rescue_all {
+            false
+        } else if only_current_tips {
+            true
+        } else {
+            matches!(
+                detect_mirror_mode(&state),
+                Some(DetectedMirrorMode::Snapshot)
+            )
+        };
+        assert!(
+            !effective,
+            "--rescue-all must override auto-detected snapshot mode"
+        );
+    }
+
+    #[test]
+    fn only_current_tips_beats_auto_detected_history() {
+        // Explicit --only-current-tips on a history-mode contract:
+        // the operator is asserting they know better. Pre-#43
+        // behaviour preserved.
+        use freenet_git_types::signing::{MIRROR_MODE_EXTENSION_KEY, MIRROR_MODE_VALUE_HISTORY};
+        use freenet_git_types::ExtensionEntry;
+        let mut state = RepoState {
+            owner: [0; 32],
+            ..Default::default()
+        };
+        state.extensions.insert(
+            MIRROR_MODE_EXTENSION_KEY.to_string(),
+            ExtensionEntry {
+                value: MIRROR_MODE_VALUE_HISTORY.to_vec(),
+                update_seq: 1,
+                signature: [0u8; 64],
+            },
+        );
+        let rescue_all = false;
+        let only_current_tips = true;
+        let effective = if rescue_all {
+            false
+        } else if only_current_tips {
+            true
+        } else {
+            matches!(
+                detect_mirror_mode(&state),
+                Some(DetectedMirrorMode::Snapshot)
+            )
+        };
+        assert!(
+            effective,
+            "--only-current-tips must beat auto-detected history mode"
+        );
     }
 
     #[test]

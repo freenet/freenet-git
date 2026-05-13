@@ -994,34 +994,47 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
         // freenet-git#43.
         if let Ok(mode_raw) = std::env::var("FREENET_GIT_MIRROR_MODE") {
             let mode = mode_raw.trim();
-            if mode == "snapshot" || mode == "history" {
-                let want = mode.as_bytes();
-                let current = state
-                    .extensions
-                    .get(MIRROR_MODE_EXTENSION_KEY)
-                    .map(|e| e.value.as_slice());
-                if current != Some(want) {
-                    let new_seq = state
+            match mode {
+                "snapshot" | "history" => {
+                    let want = mode.as_bytes();
+                    let current = state
                         .extensions
                         .get(MIRROR_MODE_EXTENSION_KEY)
-                        .map(|e| e.update_seq)
-                        .unwrap_or(0)
-                        + 1;
-                    let entry = sign_extension(
-                        &params,
-                        &signing,
-                        MIRROR_MODE_EXTENSION_KEY,
-                        want.to_vec(),
-                        new_seq,
-                    );
-                    delta
-                        .extensions
-                        .insert(MIRROR_MODE_EXTENSION_KEY.to_string(), entry);
+                        .map(|e| e.value.as_slice());
+                    if current != Some(want) {
+                        let new_seq = state
+                            .extensions
+                            .get(MIRROR_MODE_EXTENSION_KEY)
+                            .map(|e| e.update_seq)
+                            .unwrap_or(0)
+                            + 1;
+                        let entry = sign_extension(
+                            &params,
+                            &signing,
+                            MIRROR_MODE_EXTENSION_KEY,
+                            want.to_vec(),
+                            new_seq,
+                        );
+                        delta
+                            .extensions
+                            .insert(MIRROR_MODE_EXTENSION_KEY.to_string(), entry);
+                    }
                 }
-            } else if !mode.is_empty() {
-                eprintln!(
-                    "warning: ignoring FREENET_GIT_MIRROR_MODE={mode:?} -- must be \"snapshot\" or \"history\"; not recording extension"
-                );
+                "" => {
+                    // Empty / unset = no-op (legacy behaviour, no
+                    // extension write). Pass through silently.
+                }
+                bad => {
+                    // Non-empty invalid value: fail-loud. Silent skip
+                    // would let the contract drift permanently
+                    // mis-tagged after a workflow refactor or
+                    // interpolation typo. Mirrors mirror-repo.yml's
+                    // `exit 1` and rescue's `detect_mirror_mode`
+                    // strict-equality check.
+                    bail!(
+                        "FREENET_GIT_MIRROR_MODE must be the literal \"snapshot\" or \"history\" (got {bad:?})"
+                    );
+                }
             }
         }
 
