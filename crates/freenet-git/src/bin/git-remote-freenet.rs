@@ -2041,6 +2041,126 @@ mod tests {
         assert!(!commit_exists(&git_dir, bogus).unwrap());
     }
 
+    /// Helper: create a lightweight tag on the given commit.
+    fn lightweight_tag(dir: &std::path::Path, name: &str, target: &str) -> Result<()> {
+        let status = Command::new("git")
+            .current_dir(dir)
+            .args(["tag", name, target])
+            .status()?;
+        if !status.success() {
+            bail!("git tag {name} {target} failed: {status}");
+        }
+        Ok(())
+    }
+
+    /// Helper: create an annotated tag on the given commit. Returns
+    /// the tag object's SHA (distinct from the commit SHA).
+    fn annotated_tag(dir: &std::path::Path, name: &str, target: &str) -> Result<String> {
+        let status = Command::new("git")
+            .current_dir(dir)
+            .args([
+                "tag",
+                "-a",
+                name,
+                "-m",
+                &format!("annotated {name}"),
+                target,
+            ])
+            .status()?;
+        if !status.success() {
+            bail!("git tag -a {name} {target} failed: {status}");
+        }
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(["rev-parse", &format!("refs/tags/{name}")])
+            .output()?;
+        Ok(String::from_utf8(out.stdout)?.trim().to_string())
+    }
+
+    #[test]
+    fn git_resolve_ref_returns_commit_sha_for_lightweight_tag() {
+        // Lightweight tag is just a ref pointing at a commit -- no
+        // separate tag object. `git rev-parse refs/tags/<name>`
+        // returns the commit SHA directly.
+        let dir = tempfile::tempdir().unwrap();
+        let commit = init_repo_with_commit(dir.path()).unwrap();
+        lightweight_tag(dir.path(), "v0.1.0", &commit).unwrap();
+        let git_dir = dir.path().join(".git");
+        let resolved = git_resolve_ref(&git_dir, "refs/tags/v0.1.0").unwrap();
+        assert_eq!(
+            resolved, commit,
+            "lightweight tag resolves to the commit SHA"
+        );
+    }
+
+    #[test]
+    fn git_resolve_ref_returns_tag_object_sha_for_annotated_tag() {
+        // Annotated tag has its own object in the database; rev-parse
+        // returns the tag object's SHA, NOT the commit's. The bundle
+        // built from this SHA must include both the tag object and
+        // the commit it points at (verified separately by build_pack).
+        let dir = tempfile::tempdir().unwrap();
+        let commit = init_repo_with_commit(dir.path()).unwrap();
+        let tag_sha = annotated_tag(dir.path(), "v0.1.0", &commit).unwrap();
+        assert_ne!(tag_sha, commit, "annotated tag SHA differs from commit SHA");
+        let git_dir = dir.path().join(".git");
+        let resolved = git_resolve_ref(&git_dir, "refs/tags/v0.1.0").unwrap();
+        assert_eq!(
+            resolved, tag_sha,
+            "annotated tag resolves to the tag-object SHA, not the commit"
+        );
+    }
+
+    #[test]
+    fn build_pack_includes_annotated_tag_object() {
+        // Critical correctness check for freenet-git#40: when the
+        // push refspec is `refs/tags/v0.1.0:refs/tags/v0.1.0` and
+        // the tag is annotated, the pack MUST include the tag object
+        // so the receiver can dereference the ref. Without it the
+        // bundle would land on the contract pointing at an object
+        // the receiver can't resolve.
+        //
+        // Verified by counting pack-object output: build_pack with
+        // the tag-object SHA as `want` should produce a strictly
+        // larger pack than build_pack with the bare commit SHA,
+        // because the tag object is an extra reachable object.
+        let dir = tempfile::tempdir().unwrap();
+        let commit = init_repo_with_commit(dir.path()).unwrap();
+        let tag_sha = annotated_tag(dir.path(), "v0.1.0", &commit).unwrap();
+        let git_dir = dir.path().join(".git");
+
+        let pack_via_tag = build_pack(&git_dir, None, &tag_sha, false).unwrap();
+        let pack_via_commit = build_pack(&git_dir, None, &commit, false).unwrap();
+        assert!(
+            pack_via_tag.len() > pack_via_commit.len(),
+            "annotated-tag pack ({} B) must be strictly larger than \
+             commit-only pack ({} B) because it includes the tag object",
+            pack_via_tag.len(),
+            pack_via_commit.len()
+        );
+    }
+
+    #[test]
+    fn build_pack_lightweight_tag_equals_pack_from_commit() {
+        // Lightweight tag has no tag object; pushing the tag ref
+        // produces the same pack as pushing the commit directly.
+        let dir = tempfile::tempdir().unwrap();
+        let commit = init_repo_with_commit(dir.path()).unwrap();
+        lightweight_tag(dir.path(), "v0.1.0", &commit).unwrap();
+        let git_dir = dir.path().join(".git");
+        let tag_sha = git_resolve_ref(&git_dir, "refs/tags/v0.1.0").unwrap();
+        // (already proven by git_resolve_ref_returns_commit_sha_for_lightweight_tag,
+        // but worth restating in this test's context)
+        assert_eq!(tag_sha, commit);
+        let pack_via_tag = build_pack(&git_dir, None, &tag_sha, false).unwrap();
+        let pack_via_commit = build_pack(&git_dir, None, &commit, false).unwrap();
+        assert_eq!(
+            pack_via_tag.len(),
+            pack_via_commit.len(),
+            "lightweight tag pack should match commit pack byte-for-byte size"
+        );
+    }
+
     #[test]
     fn commit_exists_rejects_blob_and_tree() {
         // Edge case from the skeptical reviewer: if a SHA exists in

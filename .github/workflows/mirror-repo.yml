@@ -243,12 +243,29 @@ jobs:
           # is never an ancestor of the new tip. The Freenet contract's
           # `update_seq` monotonicity gates the actual write, so the
           # `+` is just for git's local fast-forward check.
+          #
+          # Snapshot mode does NOT push tags: each push builds a fresh
+          # orphan commit, and upstream tags point at commits in the
+          # original (non-orphan) history which aren't in the snapshot
+          # bundle. Pushing them would either fail at pack-objects
+          # ("Cannot resolve") or land in the contract pointing at
+          # unreachable objects. History mode is the only mode where
+          # tag round-trip makes sense (freenet-git#40).
           if [ "$MODE" = "snapshot" ]; then
             # shellcheck disable=SC2086
             git push freenet "+${BRANCH}:${BRANCH}" $EXTRA_ARGS
           else
+            # History mode: push branch AND all tag refs. Each push
+            # spec is handled independently by the helper (one bundle
+            # per ref); some object duplication across bundles, but
+            # correctness is straightforward. `refs/tags/*` covers
+            # both annotated and lightweight tags; the helper's
+            # ref-target field is a 20-byte SHA which can be either
+            # a commit SHA (lightweight) or a tag-object SHA
+            # (annotated), so handle_list emits both shapes
+            # correctly on fetch.
             # shellcheck disable=SC2086
-            git push freenet "${BRANCH}:${BRANCH}" $EXTRA_ARGS
+            git push freenet "${BRANCH}:${BRANCH}" "refs/tags/*:refs/tags/*" $EXTRA_ARGS
           fi
 
       # Failure notification. Fires on both `failure()` and
