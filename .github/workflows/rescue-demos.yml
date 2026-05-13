@@ -99,8 +99,21 @@ jobs:
             false) ;;
             *) echo "::error::matrix.only_current_tips must be the literal 'true' or 'false', got '$ONLY_CURRENT_TIPS'"; exit 1 ;;
           esac
+          # Pin parallelism explicitly rather than relying on the
+          # helper's default. Default-tracking would silently change
+          # cron behavior when freenet-git's default moves. 2-way
+          # outer parallelism × the chunked.rs default 8-way chunk
+          # pool = up to 16 concurrent WS PUTs per cell. Confirmed
+          # under v0.2.56's #4059 P7/P8 drain fix. If the gateway
+          # gets sicker again, lower this and reopen freenet-core#4056.
+          if freenet-git rescue --help 2>&1 | grep -q -- '--parallel-bundles'; then
+            parallel_args="--parallel-bundles 2"
+          else
+            # Pre-0.1.19 binary: outer loop is serial, nothing to set.
+            parallel_args=""
+          fi
           # shellcheck disable=SC2086
-          freenet-git rescue "$REPO" --ws-url "$WS_URL" $extra
+          freenet-git rescue "$REPO" --ws-url "$WS_URL" $extra $parallel_args
 
   # Per the GH-Actions failure-notification model: matrix cell
   # failures show up in the run summary but do not (by default) email

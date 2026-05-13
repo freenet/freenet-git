@@ -170,20 +170,27 @@ enum Cmd {
         #[arg(long)]
         only_current_tips: bool,
         /// How many bundles to rescue in parallel. Each parallel
-        /// bundle opens its own WebSocket connection to the local
-        /// node; ChunkedPack bundles additionally drive their own
-        /// 8-way chunk pool internally, so total concurrent
-        /// connections during a peak rescue is roughly `N + N*8` =
-        /// `N*9` (one per parallel bundle for SinglePack PUTs, plus
-        /// chunk-pool connections when those bundles happen to be
-        /// chunked).
+        /// bundle opens its own WebSocket connection (SinglePack)
+        /// or delegates to a chunked-pack driver that opens its
+        /// own pool of up to `FREENET_GIT_PARALLEL_OPS` chunk
+        /// connections (default 8, see `chunked::parallelism_from_env`).
+        /// Peak concurrent WebSocket connections under load is
+        /// `parallel_bundles * chunk_pool`, so 2 parallel bundles
+        /// against the default chunk pool means up to 16 concurrent
+        /// PUTs to the local node.
         ///
         /// Default of 2 is conservative against the gateway's
         /// per-handler scheduler — see freenet-core#4056 for what
         /// happens when concurrent multi-PUT traffic overruns the
-        /// `wait_for_res_tx` priority. Bump cautiously on a healthy
-        /// gateway via `FREENET_GIT_RESCUE_PARALLEL` or this flag.
-        /// `1` recovers the old strictly-serial behaviour.
+        /// `wait_for_res_tx` priority (fixed in v0.2.56 via #4059,
+        /// but the ceiling is empirical not pinned). Bump cautiously
+        /// on a healthy gateway via `FREENET_GIT_RESCUE_PARALLEL`
+        /// or this flag.
+        ///
+        /// `1` returns the outer-loop work to the pre-#44 serial
+        /// shape. Full serial behaviour (including chunks) also
+        /// requires `FREENET_GIT_PARALLEL_OPS=1`. Values of `0` are
+        /// clamped up to `1`.
         #[arg(long, env = "FREENET_GIT_RESCUE_PARALLEL", default_value = "2")]
         parallel_bundles: usize,
     },
@@ -621,10 +628,18 @@ fn rescue(
         use futures::stream::{FuturesUnordered, StreamExt};
         use std::sync::Arc;
 
+        // Tasks run via `tokio::spawn` so a panic inside
+        // `rescue_one_bundle` becomes a `JoinError` rather than
+        // unwinding through `next().await` and aborting the whole
+        // rescue. We lose the label on panic (it's captured by the
+        // closure, not surfaced through JoinError), so the failure
+        // line uses a generic placeholder — but the user still gets
+        // a count and the panic message via RUST_BACKTRACE.
         let pack_wasm = Arc::new(pack_wasm);
         let ws = Arc::new(ws);
         let mut iter = rescue_set.into_iter();
-        let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+        let mut in_flight: FuturesUnordered<tokio::task::JoinHandle<BundleOutcome>> =
+            FuturesUnordered::new();
 
         loop {
             while in_flight.len() < parallel_bundles {
@@ -635,13 +650,28 @@ fn rescue(
                 let ws = ws.clone();
                 let id_owned = *id;
                 let bundle = record.bundle.clone();
-                in_flight.push(async move {
+                in_flight.push(tokio::spawn(async move {
                     let label = format!("bundle {}", hex::encode(id_owned));
                     rescue_one_bundle(&ws, &pack_wasm, bundle, timeout, label).await
-                });
+                }));
             }
-            let Some(outcome) = in_flight.next().await else {
+            let Some(join_result) = in_flight.next().await else {
                 break;
+            };
+            let outcome = match join_result {
+                Ok(outcome) => outcome,
+                Err(join_err) if join_err.is_panic() => BundleOutcome::Err {
+                    label: "<bundle-unknown>".to_string(),
+                    kind: "panic",
+                    error: anyhow::anyhow!(
+                        "rescue task panicked: {join_err}. Re-run with RUST_BACKTRACE=1 to identify the bundle."
+                    ),
+                },
+                Err(join_err) => BundleOutcome::Err {
+                    label: "<bundle-unknown>".to_string(),
+                    kind: "cancelled",
+                    error: anyhow::anyhow!("rescue task cancelled: {join_err}"),
+                },
             };
             match outcome {
                 BundleOutcome::Ok {
