@@ -203,6 +203,18 @@ pub fn contract_id_from_wasm_hash(wasm_hash: &[u8; 32], params_bytes: &[u8]) -> 
     ContractInstanceId::new(spec)
 }
 
+/// Prefix used in `get_state`'s timeout `bail!` messages. Shared
+/// between the bail site and [`ProbeOutcome::from_get_state_err`] so
+/// editing either site without the other breaks the build (the
+/// `format!`/`contains` calls reference the same `const`), eliminating
+/// the silent-classifier-drift class skeptical-reviewer flagged on
+/// PR #54.
+const GET_TIMEOUT_PREFIX: &str = "timed out waiting for GET response";
+
+/// Prefix used in `get_state`'s NotFound `bail!` message. Same
+/// rationale as [`GET_TIMEOUT_PREFIX`].
+const GET_NOT_FOUND_SUFFIX: &str = "not found on the network";
+
 /// Classification of one probe's outcome inside
 /// [`get_state_with_legacy_fallback`]. Captured per-probe so the final
 /// bail message can describe what actually happened instead of
@@ -230,16 +242,16 @@ enum ProbeOutcome {
 }
 
 impl ProbeOutcome {
-    /// Classify the error from a single `get_state` call. The string
-    /// matching against the `bail!` messages in `get_state` is the only
-    /// reliable signal we have without restructuring `get_state`'s
-    /// return type; the strings are stable and the test
-    /// `probe_outcome_classifies_get_state_errors` pins them.
+    /// Classify the error from a single `get_state` call. Matches on
+    /// [`GET_TIMEOUT_PREFIX`] / [`GET_NOT_FOUND_SUFFIX`], which are the
+    /// same `const`s `get_state` uses in its `bail!` macros — so a
+    /// future edit to either bail message must update the `const` and
+    /// both sites stay in sync.
     fn from_get_state_err(err: &anyhow::Error) -> Self {
         let msg = err.to_string();
-        if msg.contains("timed out waiting for GET response") {
+        if msg.contains(GET_TIMEOUT_PREFIX) {
             ProbeOutcome::Timeout
-        } else if msg.contains("not found on the network") {
+        } else if msg.contains(GET_NOT_FOUND_SUFFIX) {
             ProbeOutcome::NotFound
         } else {
             ProbeOutcome::OtherError(msg)
@@ -521,15 +533,15 @@ pub async fn get_state(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            bail!("timed out waiting for GET response after {timeout:?}");
+            bail!("{GET_TIMEOUT_PREFIX} after {timeout:?}");
         }
         let response = match tokio::time::timeout(remaining, web_api.recv()).await {
             Ok(r) => r.map_err(|e| anyhow!("recv: {e}"))?,
-            Err(_) => bail!("timed out waiting for GET response after {timeout:?}"),
+            Err(_) => bail!("{GET_TIMEOUT_PREFIX} after {timeout:?}"),
         };
         match dispatch_get_response(response, id) {
             GetDispatch::State(bytes) => return Ok(bytes),
-            GetDispatch::NotFound => bail!("contract {id} not found on the network"),
+            GetDispatch::NotFound => bail!("contract {id} {GET_NOT_FOUND_SUFFIX}"),
             GetDispatch::Continue => {}
         }
     }
@@ -1270,14 +1282,20 @@ mod tests {
     }
 
     /// Pin: `ProbeOutcome::from_get_state_err` classifies the three
-    /// distinct error shapes `get_state` emits. The classification is
-    /// done by substring match against `get_state`'s `bail!` messages;
-    /// this test fails if those messages change without a corresponding
-    /// update here.
+    /// distinct error shapes `get_state` emits. Uses the same `const`s
+    /// `get_state` itself uses to build the bail messages, so a future
+    /// edit to either bail site MUST update the `const` (and the
+    /// classifier picks up the new prefix automatically) — closing the
+    /// silent-drift gap skeptical-reviewer flagged on PR #54.
     #[test]
     fn probe_outcome_classifies_get_state_errors() {
-        let timeout_err = anyhow::anyhow!("timed out waiting for GET response after 180s");
-        let not_found_err = anyhow::anyhow!("contract 3iBuNbXTrXz... not found on the network");
+        // Build the exact bail strings `get_state` would emit, by
+        // reusing the same `const`s. If `get_state` is later refactored
+        // to embed the const in a different surrounding string, this
+        // test still works as long as the const appears verbatim.
+        let timeout_err =
+            anyhow::anyhow!("{GET_TIMEOUT_PREFIX} after {:?}", Duration::from_secs(180));
+        let not_found_err = anyhow::anyhow!("contract 3iBuNbXTrXz... {GET_NOT_FOUND_SUFFIX}");
         let send_err = anyhow::anyhow!("send GET: connection reset");
 
         assert!(matches!(
