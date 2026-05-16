@@ -358,7 +358,7 @@ fn format_fallback_failure(
         return anyhow!(
             "GET timed out on all {total} probe(s) after {timeout:?} each \
              (current contract key + {} legacy key(s)); gateway or peer routing \
-             may be unhealthy — push aborted to avoid overwriting unknown state",
+             may be unhealthy — operation aborted, state on the network is unknown",
             total.saturating_sub(1)
         );
     }
@@ -367,6 +367,23 @@ fn format_fallback_failure(
             "no state found at current contract key or any of {} legacy key(s) \
              ({not_founds} authoritative NotFound, {empties} empty response)",
             total.saturating_sub(1)
+        );
+    }
+    if other_errors == total {
+        // All probes hit transport/decode errors (e.g. WebSocket closed,
+        // every send GET fails the same way). Calling this "mixed" would
+        // contradict the dominant-outcome contract, so surface the first
+        // underlying error verbatim with a count.
+        let first = outcomes
+            .iter()
+            .find_map(|(label, outcome)| match outcome {
+                ProbeOutcome::OtherError(msg) => Some(format!("{label}: {msg}")),
+                _ => None,
+            })
+            .unwrap_or_else(|| "<no detail>".to_string());
+        return anyhow!(
+            "every probe failed with transport/other error ({total} probe(s)); \
+             first failure: {first}"
         );
     }
 
@@ -1347,6 +1364,39 @@ mod tests {
         assert!(
             msg.contains("no state found"),
             "all-not-found message must say no state found, got: {msg}"
+        );
+    }
+
+    /// All-OtherError (transport/decode failures across every probe)
+    /// must be reported as a transport failure with the first underlying
+    /// error verbatim — NOT as "mixed outcomes" (Codex PR #54 P3 #2:
+    /// calling a uniform transport failure "mixed" contradicts the
+    /// dominant-outcome contract).
+    #[test]
+    fn format_fallback_failure_all_transport_errors_says_transport() {
+        let outcomes = vec![
+            (
+                "current key X".to_string(),
+                ProbeOutcome::OtherError("send GET: connection reset".to_string()),
+            ),
+            (
+                "legacy key 0 (Y)".to_string(),
+                ProbeOutcome::OtherError("send GET: connection reset".to_string()),
+            ),
+        ];
+        let err = format_fallback_failure(&outcomes, Duration::from_secs(180));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("transport/other error"),
+            "all-transport message must say transport, got: {msg}"
+        );
+        assert!(
+            msg.contains("connection reset"),
+            "must surface the underlying error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("mixed outcomes"),
+            "uniform transport failure must NOT be called mixed, got: {msg}"
         );
     }
 
