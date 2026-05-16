@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.20"
+version = "0.1.21"
 edition = "2021"
 rust-version = "1.86"
 license = "LGPL-3.0-only"
@@ -59,9 +59,9 @@ freenet-stdlib = { version = "0.6.0" }
 
 # Internal — keep both `path` and `version`. Path is used during local
 # development (workspace builds); version is required for crates.io.
-freenet-git-encoding = { path = "crates/encoding", version = "0.1.20" }
-freenet-git-types = { path = "crates/types", version = "0.1.20" }
-freenet-git-identity = { path = "crates/identity", version = "0.1.20" }
+freenet-git-encoding = { path = "crates/encoding", version = "0.1.21" }
+freenet-git-types = { path = "crates/types", version = "0.1.21" }
+freenet-git-identity = { path = "crates/identity", version = "0.1.21" }
 
 # Test utilities
 hex = "0.4"
