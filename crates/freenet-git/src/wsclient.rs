@@ -283,8 +283,86 @@ pub enum GetSource {
     },
 }
 
+/// Outcome of inspecting one [`HostResponse`] against a Get's expected
+/// instance_id. Pulled out so the per-message dispatch is unit testable
+/// without spinning up a real WebApi (mirrors `dispatch_put_response`).
+#[derive(Debug)]
+enum GetDispatch {
+    /// Caller should return `Ok(bytes)` immediately — either real state
+    /// bytes (matching `GetResponse`) or an empty `Vec` (`NotFound` for
+    /// our instance_id). The empty-bytes channel preserves
+    /// `get_state_with_legacy_fallback`'s "fall through to the next
+    /// legacy key" semantics.
+    Terminal(Vec<u8>),
+    /// Caller should skip and keep waiting on the recv loop.
+    Continue,
+}
+
+/// Decide what to do with the next message arriving on a `get_state`
+/// recv loop.
+///
+/// `NotFound` for our key is treated as `Terminal(Vec::new())` because
+/// freenet-core v0.2.56+ emits `ContractResponse::NotFound` as the
+/// terminal response when the task-per-tx GET driver exhausts every
+/// peer reachable from the gateway's ring (see freenet-core PR #4076).
+/// Pre-#4076 the legacy state machine never surfaced `NotFound` on the
+/// WS API, so this client used to deadlock the recv loop until the
+/// outer rescue timeout fired (see matrix dev-channel report
+/// 2026-05-15: "rescue-demos failure" recurring every 12h after the
+/// gateway upgrade to v0.2.57).
+///
+/// Empty bytes are valid for the "not found" channel because the only
+/// caller, `get_state_with_legacy_fallback`, already treats `Ok(empty)`
+/// as "try the next legacy key, then bail with 'no state found at
+/// current contract key or any of N legacy keys'".
+fn dispatch_get_response(response: HostResponse, id: ContractInstanceId) -> GetDispatch {
+    match response {
+        HostResponse::ContractResponse(ContractResponse::GetResponse {
+            key: got_key,
+            state,
+            ..
+        }) => {
+            if got_key.id() != &id {
+                tracing::debug!("ignoring GetResponse for unrelated key {}", got_key.id());
+                GetDispatch::Continue
+            } else {
+                GetDispatch::Terminal(state.as_ref().to_vec())
+            }
+        }
+        HostResponse::ContractResponse(ContractResponse::NotFound {
+            instance_id: nf_id,
+        }) => {
+            if nf_id != id {
+                tracing::debug!("ignoring NotFound for unrelated key {nf_id}");
+                GetDispatch::Continue
+            } else {
+                GetDispatch::Terminal(Vec::new())
+            }
+        }
+        HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+            key: notif_key,
+            ..
+        }) => {
+            // Subscription noise; ignore until our GetResponse arrives.
+            tracing::debug!(
+                "got UpdateNotification for {} while waiting for GET",
+                notif_key.id()
+            );
+            GetDispatch::Continue
+        }
+        other => {
+            tracing::debug!(?other, "ignoring non-GET response while waiting");
+            GetDispatch::Continue
+        }
+    }
+}
+
 /// GET the current state of a contract by its instance id. Returns the
 /// raw state bytes — caller decodes (e.g. via `RepoState::from_bytes`).
+///
+/// An empty `Vec` return value means the host responded with
+/// `ContractResponse::NotFound` for `id`; the legacy-fallback caller
+/// uses that signal to try the next legacy key.
 ///
 /// Setting `subscribe: true` is intentional: we want the local node to
 /// keep the contract live for us so subsequent pushes/fetches don't have
@@ -316,31 +394,9 @@ pub async fn get_state(
             Ok(r) => r.map_err(|e| anyhow!("recv: {e}"))?,
             Err(_) => bail!("timed out waiting for GET response after {timeout:?}"),
         };
-        match response {
-            HostResponse::ContractResponse(ContractResponse::GetResponse {
-                key: got_key,
-                state,
-                ..
-            }) => {
-                if got_key.id() != &id {
-                    tracing::debug!("ignoring GetResponse for unrelated key {}", got_key.id());
-                    continue;
-                }
-                return Ok(state.as_ref().to_vec());
-            }
-            HostResponse::ContractResponse(ContractResponse::UpdateNotification {
-                key: notif_key,
-                ..
-            }) => {
-                // Subscription noise; ignore until our GetResponse arrives.
-                tracing::debug!(
-                    "got UpdateNotification for {} while waiting for GET",
-                    notif_key.id()
-                );
-            }
-            other => {
-                tracing::debug!(?other, "ignoring non-GET response while waiting");
-            }
+        match dispatch_get_response(response, id) {
+            GetDispatch::Terminal(bytes) => return Ok(bytes),
+            GetDispatch::Continue => {}
         }
     }
 }
@@ -654,6 +710,116 @@ mod tests {
         assert!(matches!(
             dispatch_put_response(HostResponse::Ok, &key),
             PutDispatch::Success(_),
+        ));
+    }
+
+    #[test]
+    fn dispatch_get_response_returns_state_for_matching_get_response() {
+        let key = test_key(10);
+        let response = HostResponse::ContractResponse(ContractResponse::GetResponse {
+            key,
+            state: freenet_stdlib::prelude::WrappedState::new(b"hello".to_vec()),
+            contract: None,
+        });
+        match dispatch_get_response(response, *key.id()) {
+            GetDispatch::Terminal(bytes) => assert_eq!(bytes, b"hello"),
+            GetDispatch::Continue => panic!("expected Terminal on matching GetResponse"),
+        }
+    }
+
+    #[test]
+    fn dispatch_get_response_continues_on_unrelated_get_response() {
+        // A GetResponse for some other instance_id (e.g. from a prior
+        // subscription's race or a multiplexed connection) must be
+        // skipped, not mistaken for ours.
+        let our_id = *test_key(11).id();
+        let other_key = test_key(12);
+        let response = HostResponse::ContractResponse(ContractResponse::GetResponse {
+            key: other_key,
+            state: freenet_stdlib::prelude::WrappedState::new(b"stale".to_vec()),
+            contract: None,
+        });
+        assert!(matches!(
+            dispatch_get_response(response, our_id),
+            GetDispatch::Continue,
+        ));
+    }
+
+    /// Regression for matrix dev-channel report 2026-05-15: the
+    /// freenet-git rescue workflow hangs for the full per-op timeout
+    /// (180s default) on contracts the gateway can't find on the
+    /// network. Root cause is freenet-core PR #4076 (in v0.2.56)
+    /// adding `ContractResponse::NotFound` as the terminal response
+    /// from the task-per-tx GET driver on retry exhaustion; this
+    /// client used to ignore that arm via the `_ =>` fallback.
+    ///
+    /// Treating `NotFound` for our key as `Terminal(empty)` lets
+    /// `get_state_with_legacy_fallback` move on to the next legacy
+    /// probe — or bail with "no state found at current contract key
+    /// …" if none remain — instead of deadlocking the recv loop.
+    #[test]
+    fn dispatch_get_response_treats_not_found_as_terminal_for_our_key() {
+        let our_id = *test_key(13).id();
+        let response =
+            HostResponse::ContractResponse(ContractResponse::NotFound { instance_id: our_id });
+        match dispatch_get_response(response, our_id) {
+            GetDispatch::Terminal(bytes) => assert!(
+                bytes.is_empty(),
+                "NotFound must surface as empty bytes so the legacy-fallback caller \
+                 distinguishes it from a real GetResponse with state"
+            ),
+            GetDispatch::Continue => panic!(
+                "regression: NotFound for our key must be a terminal outcome, \
+                 not Continue (would deadlock the recv loop until rescue timeout)"
+            ),
+        }
+    }
+
+    #[test]
+    fn dispatch_get_response_skips_not_found_for_unrelated_key() {
+        // NotFound for a different contract (e.g. a sub-operation or a
+        // multiplexed legacy-probe race) must not be mistaken for ours.
+        let our_id = *test_key(14).id();
+        let other_id = *test_key(15).id();
+        let response = HostResponse::ContractResponse(ContractResponse::NotFound {
+            instance_id: other_id,
+        });
+        assert!(matches!(
+            dispatch_get_response(response, our_id),
+            GetDispatch::Continue,
+        ));
+    }
+
+    #[test]
+    fn dispatch_get_response_skips_update_notification() {
+        let our_id = *test_key(16).id();
+        let other_key = test_key(17);
+        let response = HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+            key: other_key,
+            update: freenet_stdlib::prelude::UpdateData::State(
+                freenet_stdlib::prelude::State::from(vec![]).into_owned(),
+            ),
+        });
+        assert!(matches!(
+            dispatch_get_response(response, our_id),
+            GetDispatch::Continue,
+        ));
+    }
+
+    #[test]
+    fn dispatch_get_response_continues_on_unrelated_contract_response() {
+        // Defends against silently swallowing a brand-new ContractResponse
+        // variant. SubscribeResponse for an unrelated key should be
+        // skipped, not mistaken for our GET.
+        let our_id = *test_key(18).id();
+        let other_key = test_key(19);
+        let response = HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+            key: other_key,
+            subscribed: true,
+        });
+        assert!(matches!(
+            dispatch_get_response(response, our_id),
+            GetDispatch::Continue,
         ));
     }
 
