@@ -41,16 +41,37 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use freenet_git_types::signing::parse_bundle_tip_extension_key;
-use freenet_git_types::{ObjectBundle, ObjectBundleId, RepoState};
+use freenet_git_types::{ObjectBundleId, RepoState};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 /// Map from expected pack BLAKE3 → reconstructed pack bytes. The
 /// caller (rescue's per-bundle path) looks up the bundle's expected
-/// pack_hash and PUTs the bytes when present.
-pub type LocalPackMap = HashMap<[u8; 32], Vec<u8>>;
+/// pack_hash and PUTs the bytes when present. Bytes are `Arc`-wrapped
+/// so parallel rescues don't deep-clone for each PUT.
+pub type LocalPackMap = HashMap<[u8; 32], Arc<Vec<u8>>>;
+
+/// Normalize a user-supplied `--from <path>` to the actual git
+/// directory git's `--git-dir` flag expects. If `<path>/.git` is a
+/// directory the user passed a worktree root → return `<path>/.git`.
+/// Otherwise return `<path>` as-is (handles bare repos and explicit
+/// `.git` directory paths).
+///
+/// Codex PR #55 P2 #2: without this, a user invoking `--from
+/// /path/to/clone` would silently fail every reconstruction because
+/// `git --git-dir /path/to/clone` treats the worktree as if it WERE
+/// the git directory (no `.git` auto-append) and every command fails.
+pub fn normalize_git_dir(path: &Path) -> PathBuf {
+    let dot_git = path.join(".git");
+    if dot_git.is_dir() {
+        dot_git
+    } else {
+        path.to_path_buf()
+    }
+}
 
 /// Build the local-pack map from a working git directory and the
 /// contract's current `RepoState`.
@@ -68,6 +89,9 @@ pub type LocalPackMap = HashMap<[u8; 32], Vec<u8>>;
 /// reproducibility holds) are silently dropped from the map and the
 /// rescue falls back to the GET-only path.
 pub fn build_local_pack_map(git_dir: &Path, state: &RepoState) -> Result<LocalPackMap> {
+    let git_dir = normalize_git_dir(git_dir);
+    let git_dir = git_dir.as_path();
+
     // 1. Collect bundle-tip extensions: (bundle_id, tip_commit_sha)
     let mut tips: Vec<(ObjectBundleId, [u8; 20])> = Vec::new();
     for (ext_key, entry) in &state.extensions {
@@ -96,13 +120,20 @@ pub fn build_local_pack_map(git_dir: &Path, state: &RepoState) -> Result<LocalPa
         return Ok(LocalPackMap::new());
     }
 
-    // 2. Sort chronologically by commit timestamp. Bundles whose tip
-    //    isn't in the local clone get filtered out here.
-    let mut tips_with_time: Vec<(ObjectBundleId, [u8; 20], i64)> = Vec::with_capacity(tips.len());
+    // 2. Order tips by ANCESTRY, not committer date. Each push's new
+    //    tip is a descendant of the previous push's tip in a linear
+    //    history-mode chain, so we can order by how many ancestors
+    //    each tip has reachable in the local clone (more ancestors =
+    //    later push). Codex/skeptical PR #55: committer-date sort can
+    //    mis-pair (prev, new) when merge commits or imported history
+    //    produce out-of-order timestamps.
+    //
+    //    Tips whose commit isn't in the local clone get filtered out.
+    let mut tips_with_order: Vec<(ObjectBundleId, [u8; 20], u64)> = Vec::with_capacity(tips.len());
     let mut skipped_missing = 0usize;
     for (bundle_id, tip) in &tips {
-        match commit_timestamp(git_dir, tip) {
-            Ok(ts) => tips_with_time.push((*bundle_id, *tip, ts)),
+        match ancestor_count(git_dir, tip) {
+            Ok(n) => tips_with_order.push((*bundle_id, *tip, n)),
             Err(_) => skipped_missing += 1,
         }
     }
@@ -112,18 +143,22 @@ pub fn build_local_pack_map(git_dir: &Path, state: &RepoState) -> Result<LocalPa
              --from will not be able to reconstruct those bundles"
         );
     }
-    tips_with_time.sort_by_key(|(_, _, t)| *t);
+    // Two tips with the same reachable-commit count would be siblings
+    // (neither an ancestor of the other) — shouldn't happen for linear
+    // history-mode pushes. The tiebreak on tip bytes makes the order
+    // deterministic across runs even if it occurs.
+    tips_with_order.sort_by(|a, b| a.2.cmp(&b.2).then(a.1.cmp(&b.1)));
 
     // 3. For each consecutive (prev, new), build the pack and hash it.
     let mut map = LocalPackMap::new();
     let mut prev_tip: Option<[u8; 20]> = None;
-    for (_bundle_id, new_tip, _) in &tips_with_time {
+    for (_bundle_id, new_tip, _) in &tips_with_order {
         let prev_hex = prev_tip.as_ref().map(hex::encode);
         let new_hex = hex::encode(new_tip);
         match build_pack_for_range(git_dir, prev_hex.as_deref(), &new_hex) {
             Ok(pack_bytes) => {
                 let pack_hash: [u8; 32] = blake3::hash(&pack_bytes).as_bytes().to_owned();
-                map.insert(pack_hash, pack_bytes);
+                map.insert(pack_hash, Arc::new(pack_bytes));
             }
             Err(e) => {
                 eprintln!(
@@ -138,25 +173,25 @@ pub fn build_local_pack_map(git_dir: &Path, state: &RepoState) -> Result<LocalPa
     Ok(map)
 }
 
-/// Resolve the expected pack hash for a bundle, returning `None` for
-/// non-`SinglePack` variants. Used by the rescue code to look up the
-/// bundle's reconstructed bytes in [`LocalPackMap`].
-pub fn expected_pack_hash(bundle: &ObjectBundle) -> Option<[u8; 32]> {
-    match bundle {
-        ObjectBundle::SinglePack { pack_hash, .. } => Some(*pack_hash),
-        ObjectBundle::ChunkedPack { .. } => None,
-    }
-}
-
-/// Build a pack for the symmetric difference `(prev..new]` from the
-/// given git working directory. Equivalent to git-remote-freenet's
-/// internal `build_pack` (no `--thin`, no `--no-reuse-delta`); using
-/// the same flags is what gives byte-for-byte reproducibility against
-/// the originally-pushed pack.
+/// Build a pack for the symmetric difference `(have..want]` from the
+/// given git directory, with `pack.threads=1` so the delta search is
+/// deterministic.
+///
+/// Skeptical-reviewer PR #55 H1: `git pack-objects` with the default
+/// `pack.threads=auto` produces non-deterministic output because the
+/// per-thread delta search races. Same object set → different deltas
+/// → different pack bytes → different BLAKE3. Without `pack.threads=1`
+/// the reconstructed map would lose half its entries on CI runners
+/// with a different CPU count than the original publisher's machine,
+/// silently degrading rescue success rate. Single-threaded delta
+/// search trades wall-clock for bit-for-bit reproducibility (rescue
+/// runs are not a hot path; correctness > speed here).
+///
+/// The original `build_pack` in git-remote-freenet.rs intentionally
+/// doesn't carry this flag — push paths create fresh bundles whose
+/// `pack_hash` is whatever the pack-objects run produced, so non-
+/// determinism doesn't matter there.
 fn build_pack_for_range(git_dir: &Path, have: Option<&str>, want: &str) -> Result<Vec<u8>> {
-    // git_dir may be either a `.git` directory or a working-tree path;
-    // git accepts both via `--git-dir` (a working-tree path is treated
-    // as if `.git` were appended).
     let mut rev_list = Command::new("git");
     rev_list.arg("--git-dir").arg(git_dir);
     rev_list.args(["rev-list", "--objects", want]);
@@ -181,7 +216,8 @@ fn build_pack_for_range(git_dir: &Path, have: Option<&str>, want: &str) -> Resul
     let mut child = Command::new("git")
         .arg("--git-dir")
         .arg(git_dir)
-        .args(["pack-objects", "--stdout"])
+        // -c pack.threads=1: see fn-level docs (H1 fix).
+        .args(["-c", "pack.threads=1", "pack-objects", "--stdout"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -209,50 +245,58 @@ fn build_pack_for_range(git_dir: &Path, have: Option<&str>, want: &str) -> Resul
     Ok(out.stdout)
 }
 
-/// Commit timestamp in seconds-since-epoch (committer date). Used to
-/// chronologically order bundle tips before pairing them into push
-/// ranges. Returns `Err` if the commit isn't in the local clone.
-fn commit_timestamp(git_dir: &Path, commit_sha: &[u8; 20]) -> Result<i64> {
+/// Count of commits reachable from `commit_sha` in the local clone.
+/// Used as a topological ordinal for sorting bundle tips by push
+/// chronology — for a linear history-mode push chain, the Nth push's
+/// tip has more reachable commits than the (N-1)th push's tip.
+/// Returns `Err` if the commit isn't in the local clone.
+fn ancestor_count(git_dir: &Path, commit_sha: &[u8; 20]) -> Result<u64> {
     let hex = hex::encode(commit_sha);
     let out = Command::new("git")
         .arg("--git-dir")
         .arg(git_dir)
-        .args(["log", "-1", "--format=%ct", &hex])
+        .args(["rev-list", "--count", &hex])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .context("spawn git log")?;
+        .context("spawn git rev-list --count")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("commit {hex} not in local clone: {}", stderr.trim());
     }
-    let s = String::from_utf8(out.stdout).context("git log output not utf-8")?;
+    let s = String::from_utf8(out.stdout).context("git rev-list output not utf-8")?;
     s.trim()
-        .parse::<i64>()
-        .with_context(|| format!("parse timestamp from {s:?}"))
+        .parse::<u64>()
+        .with_context(|| format!("parse ancestor count from {s:?}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
 
-    /// Pin: `expected_pack_hash` extracts the pack_hash for SinglePack
-    /// and returns None for ChunkedPack. The rescue code's lookup gate
-    /// depends on this distinction.
+    /// Pin: `normalize_git_dir` returns `<path>/.git` when the user
+    /// passes a worktree root (the documented invocation shape from
+    /// `--from`'s help text). Codex PR #55 P2 #2 caught that without
+    /// this, the user's literal `--from /path/to/clone` would silently
+    /// produce a 0-pack map because `git --git-dir /path/to/clone`
+    /// treats the worktree itself as the git directory.
     #[test]
-    fn expected_pack_hash_returns_singlepack_only() {
-        let hash = [7u8; 32];
-        let single = ObjectBundle::SinglePack {
-            pack_hash: hash,
-            size_bytes: 100,
-        };
-        let chunked = ObjectBundle::ChunkedPack {
-            manifest_hash: hash,
-            chunk_count: 3,
-            total_size: 300,
-        };
-        assert_eq!(expected_pack_hash(&single), Some(hash));
-        assert_eq!(expected_pack_hash(&chunked), None);
+    fn normalize_git_dir_appends_dot_git_for_worktree_root() {
+        let tmp = TempDir::new().unwrap();
+        let dot_git = tmp.path().join(".git");
+        fs::create_dir(&dot_git).unwrap();
+        assert_eq!(normalize_git_dir(tmp.path()), dot_git);
+    }
+
+    /// Pin: `normalize_git_dir` passes through paths that don't have a
+    /// `.git` subdir (bare repos, or an explicit `.git` path).
+    #[test]
+    fn normalize_git_dir_passes_through_bare_or_dot_git() {
+        let tmp = TempDir::new().unwrap();
+        // No .git subdir → passed through as-is.
+        assert_eq!(normalize_git_dir(tmp.path()), tmp.path());
     }
 
     /// Pin: `build_local_pack_map` returns an empty map for a state

@@ -1064,7 +1064,11 @@ async fn rescue_pack(
                      reconstructed locally via --from, re-PUTting",
                     hex::encode(pack_hash)
                 );
-                wsclient::put_pack(api, pack_wasm, local_bytes.clone(), timeout)
+                // Bytes are Arc<Vec<u8>> in the map; the (*local_bytes).clone()
+                // deep-clones once per PUT. The Arc itself is cheap; the deep
+                // clone is the unavoidable cost of put_pack taking an owned
+                // Vec<u8>. Future: thread Arc through put_pack to skip this.
+                wsclient::put_pack(api, pack_wasm, (**local_bytes).clone(), timeout)
                     .await
                     .with_context(|| {
                         format!(
