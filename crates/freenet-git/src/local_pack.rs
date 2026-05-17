@@ -32,14 +32,15 @@
 //!    don't affect it.
 //! 3. For each tip, generate MULTIPLE candidate `(prev, new)` packs:
 //!    chained-from-previous (the common same-ref push case) AND
-//!    no-prev (the new-ref case — e.g. a tag bundle whose original
+//!    no-prev (the new-ref case, e.g. a tag bundle whose original
 //!    pack covered everything reachable from the tag). The push code
 //!    in git-remote-freenet.rs uses `state.refs.get(&dst)` to pick
-//!    each ref's prev independently, so a single push of `main:main`
-//!    + `refs/tags/*:refs/tags/*` creates one main-bundle (prev =
-//!    last-known main tip) and one tag-bundle per new tag (prev =
-//!    None). Trying both candidates per tip covers both shapes
-//!    without needing to record which ref the bundle came from.
+//!    each ref's prev independently, so a single push of both
+//!    `main:main` and `refs/tags/*:refs/tags/*` creates one
+//!    main-bundle (prev = last-known main tip) and one tag-bundle
+//!    per new tag (prev = None). Trying both candidates per tip
+//!    covers both shapes without needing to record which ref the
+//!    bundle came from.
 //! 4. BLAKE3 every reconstructed pack, store `(pack_hash ->
 //!    pack_bytes)`. Wrong-content packs (from mis-paired candidates)
 //!    land under their own hash and are silently never looked up.
