@@ -196,9 +196,14 @@ pub fn build_local_pack_map(git_dir: &Path, state: &RepoState) -> Result<LocalPa
 }
 
 /// Build the pack for `(have..want]` and insert it into `map` keyed
-/// by its reconstructed BLAKE3. Failures are logged at info-level but
-/// don't propagate — a single failing reconstruction shouldn't abort
-/// the entire `--from` setup for other bundles that would have worked.
+/// by its reconstructed BLAKE3. Failures are logged at `debug!` and
+/// don't propagate — the multi-candidate algorithm intentionally
+/// tries both chained-prev AND no-prev for each tip, so one
+/// candidate failing per tip is normal (not all tips have a
+/// meaningful chained-prev) and surfacing those as info-level would
+/// be noise in operator logs. Real "rescue couldn't reconstruct this
+/// bundle" surfaces later at the rescue_pack call site when the
+/// expected pack_hash isn't in the map.
 fn try_reconstruct_into(git_dir: &Path, have: Option<&str>, want: &str, map: &mut LocalPackMap) {
     match build_pack_for_range(git_dir, have, want) {
         Ok(pack_bytes) => {
