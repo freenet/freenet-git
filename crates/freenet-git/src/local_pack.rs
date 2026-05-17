@@ -26,16 +26,24 @@
 //!
 //! 1. Read every `bundle-tip:<id>` extension from the contract state
 //!    (each value is a 20-byte commit SHA — the tip the bundle covers).
-//! 2. Sort tips chronologically by commit timestamp (`git log -1
-//!    --format=%ct`). Linear pushes produce a chain; out-of-order
-//!    bundles (e.g. a force-push that wasn't reflected in main's
-//!    ancestor chain) get whatever order their committer date puts
-//!    them in — best-effort.
-//! 3. For each consecutive (prev_tip, new_tip) pair, run
-//!    `git pack-objects` on the symmetric difference, BLAKE3 the
-//!    bytes, and store `(pack_hash -> pack_bytes)` in the lookup map.
-//!    The first bundle's `prev_tip` is `None` (full history pack).
-//! 4. At rescue time, when `wsclient::get_pack` fails for a bundle,
+//! 2. Order tips by reachable-commit count (`git rev-list --count`),
+//!    tie-break on tip bytes. For linear history-mode pushes this is
+//!    the actual push chronology; out-of-order timestamps from merges
+//!    don't affect it.
+//! 3. For each tip, generate MULTIPLE candidate `(prev, new)` packs:
+//!    chained-from-previous (the common same-ref push case) AND
+//!    no-prev (the new-ref case — e.g. a tag bundle whose original
+//!    pack covered everything reachable from the tag). The push code
+//!    in git-remote-freenet.rs uses `state.refs.get(&dst)` to pick
+//!    each ref's prev independently, so a single push of `main:main`
+//!    + `refs/tags/*:refs/tags/*` creates one main-bundle (prev =
+//!    last-known main tip) and one tag-bundle per new tag (prev =
+//!    None). Trying both candidates per tip covers both shapes
+//!    without needing to record which ref the bundle came from.
+//! 4. BLAKE3 every reconstructed pack, store `(pack_hash ->
+//!    pack_bytes)`. Wrong-content packs (from mis-paired candidates)
+//!    land under their own hash and are silently never looked up.
+//! 5. At rescue time, when `wsclient::get_pack` fails for a bundle,
 //!    look up the bundle's expected pack hash in the map; if present,
 //!    PUT those bytes directly.
 
@@ -149,28 +157,62 @@ pub fn build_local_pack_map(git_dir: &Path, state: &RepoState) -> Result<LocalPa
     // deterministic across runs even if it occurs.
     tips_with_order.sort_by(|a, b| a.2.cmp(&b.2).then(a.1.cmp(&b.1)));
 
-    // 3. For each consecutive (prev, new), build the pack and hash it.
+    // 3. For each tip, try multiple candidate `(prev, new)` pairs
+    //    and store every reconstructed pack's hash in the map. Codex
+    //    PR #55 P2 #1: a history-mode push that includes multiple
+    //    refspecs (e.g. `main:main` + `refs/tags/*:refs/tags/*` —
+    //    exactly what the rescue-demos workflow does) creates a
+    //    bundle per ref, each with its own `prev` taken from
+    //    `state.refs.get(&dst)`. A newly-created tag has `prev =
+    //    None` (the bundle's pack is everything reachable from the
+    //    tag), while a branch push uses the branch's previous tip.
+    //    Chaining every tip through one global ordering would miss
+    //    the tag-bundle case. Build BOTH the chained-prev pack AND
+    //    the no-prev pack for each tip; the actual original pack
+    //    matches one of them and lands in the map under its true
+    //    hash. Wrong-content packs land under their (mismatched)
+    //    hash and are silently never looked up.
     let mut map = LocalPackMap::new();
     let mut prev_tip: Option<[u8; 20]> = None;
     for (_bundle_id, new_tip, _) in &tips_with_order {
-        let prev_hex = prev_tip.as_ref().map(hex::encode);
         let new_hex = hex::encode(new_tip);
-        match build_pack_for_range(git_dir, prev_hex.as_deref(), &new_hex) {
-            Ok(pack_bytes) => {
-                let pack_hash: [u8; 32] = blake3::hash(&pack_bytes).as_bytes().to_owned();
-                map.insert(pack_hash, Arc::new(pack_bytes));
-            }
-            Err(e) => {
-                eprintln!(
-                    "info: failed to reconstruct pack for tip {new_hex}: {e}; \
-                     --from cannot rescue this bundle"
-                );
-            }
+
+        // Candidate A: chained from previous tip in ancestry order
+        // (the common case for sequential same-ref pushes).
+        if let Some(prev) = prev_tip.as_ref() {
+            let prev_hex = hex::encode(prev);
+            try_reconstruct_into(git_dir, Some(&prev_hex), &new_hex, &mut map);
         }
+        // Candidate B: no prev (the new-ref case, e.g. a newly-pushed
+        // tag, where the original pack covered everything reachable
+        // from the tip). Also serves as the very first bundle's
+        // canonical reconstruction.
+        try_reconstruct_into(git_dir, None, &new_hex, &mut map);
+
         prev_tip = Some(*new_tip);
     }
 
     Ok(map)
+}
+
+/// Build the pack for `(have..want]` and insert it into `map` keyed
+/// by its reconstructed BLAKE3. Failures are logged at info-level but
+/// don't propagate — a single failing reconstruction shouldn't abort
+/// the entire `--from` setup for other bundles that would have worked.
+fn try_reconstruct_into(git_dir: &Path, have: Option<&str>, want: &str, map: &mut LocalPackMap) {
+    match build_pack_for_range(git_dir, have, want) {
+        Ok(pack_bytes) => {
+            let pack_hash: [u8; 32] = blake3::hash(&pack_bytes).as_bytes().to_owned();
+            map.entry(pack_hash).or_insert_with(|| Arc::new(pack_bytes));
+        }
+        Err(e) => {
+            let label = match have {
+                Some(h) => format!("({h}..{want}]"),
+                None => format!("(.., {want}]"),
+            };
+            tracing::debug!("local-pack reconstruction failed for {label}: {e}");
+        }
+    }
 }
 
 /// Build a pack for the symmetric difference `(have..want]` from the

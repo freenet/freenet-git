@@ -1290,10 +1290,17 @@ fn build_pack(
         bail!("git rev-list failed: {}", rev_list_out.status);
     }
 
+    // `-c pack.threads=1`: the pack that lands on the contract here
+    // is what `freenet-git rescue --from <git-dir>` will later try to
+    // reconstruct byte-for-byte. Default `pack.threads=auto` races
+    // delta search across cores → non-deterministic pack bytes →
+    // future rescues' reconstructions silently miss the lookup map.
+    // Pinning single-threaded is a small per-push wall-clock cost
+    // for permanent rescue reproducibility. See PR #55 Codex P2 #2.
     let mut child = Command::new("git")
         .arg("--git-dir")
         .arg(git_dir)
-        .args(["pack-objects", "--stdout"])
+        .args(["-c", "pack.threads=1", "pack-objects", "--stdout"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
