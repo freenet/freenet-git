@@ -55,10 +55,13 @@ jobs:
         include:
           - repo: "freenet:3GEERif5ihbf/freenet-core"
             only_current_tips: true   # snapshot mode
+            github_repo: ""           # --from not supported in snapshot mode
           - repo: "freenet:96rknpy1GYhZ/freenet-stdlib"
             only_current_tips: false  # history mode
+            github_repo: "freenet/freenet-stdlib"
           - repo: "freenet:99TmCayXn6Tm/freenet-git"
             only_current_tips: false  # history mode (self-mirror)
+            github_repo: "freenet/freenet-git"
     steps:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -66,11 +69,32 @@ jobs:
       - name: Install freenet-git from crates.io
         run: cargo install freenet-git --locked
 
+      # Clone the upstream GitHub repo so rescue can reconstruct missing
+      # packs from local objects via `--from`. Only history-mode cells
+      # get a clone; snapshot-mode cells (freenet-core) skip this step
+      # because `--from` doesn't help with force-pushed orphan commits.
+      #
+      # The clone has to be deep enough to contain every commit the
+      # contract's bundle-tip extensions reference -- which can be
+      # arbitrarily far back in history depending on how many mirror
+      # pushes have accumulated. Use a full clone (no --depth) so any
+      # historical bundle's tip is reachable. For freenet-stdlib and
+      # freenet-git this is small (a few MiB); for larger history-mode
+      # repos in the future this should be revisited.
+      - name: Clone upstream for --from
+        if: matrix.github_repo != ''
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.github_repo }}
+          path: upstream
+          fetch-depth: 0
+
       - name: Rescue
         env:
           REPO: ${{ matrix.repo }}
           WS_URL: ${{ secrets.FREENET_GIT_WS_URL }}
           ONLY_CURRENT_TIPS: ${{ matrix.only_current_tips }}
+          GITHUB_REPO: ${{ matrix.github_repo }}
         run: |
           set -euo pipefail
           # Probe the installed binary for --only-current-tips support
@@ -112,8 +136,21 @@ jobs:
             # Pre-0.1.19 binary: outer loop is serial, nothing to set.
             parallel_args=""
           fi
+          # --from <git-dir> (0.1.23+) reconstructs missing pack bytes
+          # from a local clone when the gateway has evicted them, fixing
+          # the "1 bundle(s) failed to rescue: GET pack ..." class of
+          # failures (freenet-git#54 + associated rescue-demos rotation).
+          # Only history-mode cells get a clone (see matrix matrix
+          # `github_repo` field) -- snapshot-mode cells fall through to
+          # the GET-only path because `--from` can't help with force-
+          # pushed orphan commits whose ranges aren't recorded in
+          # contract metadata.
+          from_args=""
+          if [ -n "$GITHUB_REPO" ] && freenet-git rescue --help 2>&1 | grep -q -- '--from'; then
+            from_args="--from upstream/.git"
+          fi
           # shellcheck disable=SC2086
-          freenet-git rescue "$REPO" --ws-url "$WS_URL" $extra $parallel_args
+          freenet-git rescue "$REPO" --ws-url "$WS_URL" $extra $parallel_args $from_args
 
   # Per the GH-Actions failure-notification model: matrix cell
   # failures show up in the run summary but do not (by default) email

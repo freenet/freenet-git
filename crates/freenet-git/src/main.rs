@@ -208,6 +208,25 @@ enum Cmd {
         /// clamped up to `1`.
         #[arg(long, env = "FREENET_GIT_RESCUE_PARALLEL", default_value = "2")]
         parallel_bundles: usize,
+        /// Reconstruct missing pack bytes from a local git clone when
+        /// the gateway no longer has them cached. Pass the path to a
+        /// working git directory of the same repo (the `.git` of a
+        /// clone is fine; so is a bare repo). Without this flag, a
+        /// bundle whose pack has been evicted everywhere fails the
+        /// rescue with "GET pack ..." — the documented pre-0.1.23
+        /// behavior. With `--from <git-dir>`, rescue rebuilds the
+        /// pack locally via `git pack-objects` and re-PUTs the same
+        /// byte-for-byte bytes (pack output is deterministic for a
+        /// given object set + git version).
+        ///
+        /// **Scope**: history-mode mirrors + SinglePack bundles only.
+        /// Snapshot-mode contracts and ChunkedPack bundles fall
+        /// through to the GET-only path because their reconstruction
+        /// shape isn't recoverable from the contract metadata today
+        /// (snapshot mode force-pushes fresh orphan commits per run;
+        /// ChunkedPack's chunk_size isn't stored in object_index).
+        #[arg(long, value_name = "GIT_DIR")]
+        from: Option<std::path::PathBuf>,
     },
 }
 
@@ -265,6 +284,7 @@ fn run(cli: Cli) -> Result<()> {
             only_current_tips,
             rescue_all,
             parallel_bundles,
+            from,
         } => rescue(
             &url,
             ws_url.as_deref(),
@@ -272,6 +292,7 @@ fn run(cli: Cli) -> Result<()> {
             only_current_tips,
             rescue_all,
             parallel_bundles,
+            from.as_deref(),
         ),
     }
 }
@@ -549,6 +570,7 @@ fn rescue(
     only_current_tips: bool,
     rescue_all: bool,
     parallel_bundles: usize,
+    from: Option<&std::path::Path>,
 ) -> Result<()> {
     let parallel_bundles = parallel_bundles.max(1);
     let parsed = url::parse(url_str).with_context(|| format!("parse {url_str}"))?;
@@ -670,6 +692,31 @@ fn rescue(
         // is roughly `parallel_bundles + parallel_bundles*8`.
         drop(api);
 
+        // Pre-build the local-pack reconstruction map if --from was
+        // supplied. Done up-front (before bundle dispatch) so each
+        // per-bundle task can do a cheap HashMap lookup on its
+        // expected pack hash. Empty map if `--from` not set; bundles
+        // whose gateway GET fails will then fall through to the
+        // existing error path (same as pre-0.1.23 behavior).
+        let local_pack_map: std::sync::Arc<freenet_git_cli::local_pack::LocalPackMap> =
+            if let Some(git_dir) = from {
+                let map = freenet_git_cli::local_pack::build_local_pack_map(git_dir, &state)
+                    .with_context(|| {
+                        format!(
+                            "build local-pack reconstruction map from --from {}",
+                            git_dir.display()
+                        )
+                    })?;
+                eprintln!(
+                    "==> --from {}: reconstructed {} pack(s) locally for fallback",
+                    git_dir.display(),
+                    map.len()
+                );
+                std::sync::Arc::new(map)
+            } else {
+                std::sync::Arc::new(freenet_git_cli::local_pack::LocalPackMap::new())
+            };
+
         // FuturesUnordered with admission control: keep at most
         // `parallel_bundles` rescue tasks in flight; backfill as
         // each one completes. The driver runs on a current-thread
@@ -702,9 +749,11 @@ fn rescue(
                 let ws = ws.clone();
                 let id_owned = *id;
                 let bundle = record.bundle.clone();
+                let local_pack_map = local_pack_map.clone();
                 in_flight.push(tokio::spawn(async move {
                     let label = format!("bundle {}", hex::encode(id_owned));
-                    rescue_one_bundle(&ws, &pack_wasm, bundle, timeout, label).await
+                    rescue_one_bundle(&ws, &pack_wasm, bundle, timeout, label, local_pack_map)
+                        .await
                 }));
             }
             let Some(join_result) = in_flight.next().await else {
@@ -940,6 +989,7 @@ async fn rescue_one_bundle(
     bundle: freenet_git_types::ObjectBundle,
     timeout: Duration,
     label: String,
+    local_pack_map: std::sync::Arc<freenet_git_cli::local_pack::LocalPackMap>,
 ) -> BundleOutcome {
     match bundle {
         freenet_git_types::ObjectBundle::SinglePack { pack_hash, .. } => {
@@ -953,7 +1003,7 @@ async fn rescue_one_bundle(
                     };
                 }
             };
-            match rescue_pack(&mut api, pack_wasm, pack_hash, timeout).await {
+            match rescue_pack(&mut api, pack_wasm, pack_hash, timeout, &local_pack_map).await {
                 Ok(()) => BundleOutcome::Ok {
                     label,
                     kind_label: "SinglePack".to_string(),
@@ -990,14 +1040,43 @@ async fn rescue_pack(
     pack_wasm: &[u8],
     pack_hash: [u8; 32],
     timeout: Duration,
+    local_pack_map: &freenet_git_cli::local_pack::LocalPackMap,
 ) -> Result<()> {
-    let bytes = wsclient::get_pack(api, pack_wasm, pack_hash, timeout)
-        .await
-        .with_context(|| format!("GET pack {}", hex::encode(pack_hash)))?;
-    wsclient::put_pack(api, pack_wasm, bytes, timeout)
-        .await
-        .with_context(|| format!("PUT pack {}", hex::encode(pack_hash)))?;
-    Ok(())
+    // Try the gateway first. If it has the pack, GET-then-PUT is the
+    // happy path and the local-reconstruction work was wasted effort
+    // for this bundle — which is fine, build_local_pack_map runs once
+    // up-front and the per-bundle cost is just a HashMap lookup.
+    match wsclient::get_pack(api, pack_wasm, pack_hash, timeout).await {
+        Ok(bytes) => {
+            wsclient::put_pack(api, pack_wasm, bytes, timeout)
+                .await
+                .with_context(|| format!("PUT pack {}", hex::encode(pack_hash)))?;
+            Ok(())
+        }
+        Err(gateway_err) => {
+            // Gateway can't serve this pack. Try local reconstruction
+            // before reporting failure. The map is empty when --from
+            // wasn't passed, so this lookup is a cheap no-op for the
+            // pre-0.1.23 invocation shape.
+            if let Some(local_bytes) = local_pack_map.get(&pack_hash) {
+                eprintln!(
+                    "info: pack {} not available from gateway ({gateway_err}); \
+                     reconstructed locally via --from, re-PUTting",
+                    hex::encode(pack_hash)
+                );
+                wsclient::put_pack(api, pack_wasm, local_bytes.clone(), timeout)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "PUT reconstructed pack {} (from local clone)",
+                            hex::encode(pack_hash)
+                        )
+                    })?;
+                return Ok(());
+            }
+            Err(gateway_err).with_context(|| format!("GET pack {}", hex::encode(pack_hash)))
+        }
+    }
 }
 
 /// Rescue a chunked-pack bundle. Each chunk is GET'd then re-PUT;
