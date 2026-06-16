@@ -258,20 +258,43 @@ impl ProbeOutcome {
         }
     }
 
-    /// True if this outcome describes a *transient* condition worth
-    /// retrying the whole probe sequence for. A [`Timeout`] (gateway
-    /// has the contract but routing was slow) and a transient host
-    /// backpressure [`OtherError`] (see [`is_transient_host_error`])
-    /// both qualify; an authoritative [`NotFound`] / [`Empty`] or any
-    /// non-retryable transport error does not — retrying those just
-    /// burns time and would mask genuine data loss behind a delay.
-    fn is_transient(&self) -> bool {
+    /// How this single outcome bears on whether the *whole* probe
+    /// sequence is worth retrying. See [`RetryDisposition`].
+    fn retry_disposition(&self) -> RetryDisposition {
         match self {
-            ProbeOutcome::Timeout => true,
-            ProbeOutcome::OtherError(msg) => is_transient_host_error(msg),
-            ProbeOutcome::NotFound | ProbeOutcome::Empty => false,
+            ProbeOutcome::Timeout => RetryDisposition::Transient,
+            ProbeOutcome::OtherError(msg) if is_transient_host_error(msg) => {
+                RetryDisposition::Transient
+            }
+            // A non-transient transport error (dead connection, send
+            // failure) will not clear on a retry over the same WebApi.
+            ProbeOutcome::OtherError(_) => RetryDisposition::HardError,
+            // Authoritative for THIS key only.
+            ProbeOutcome::NotFound | ProbeOutcome::Empty => RetryDisposition::Authoritative,
         }
     }
+}
+
+/// How a single [`ProbeOutcome`] bears on whether the whole probe
+/// sequence is worth retrying ([`outcomes_worth_retrying`]).
+#[derive(Debug, PartialEq, Eq)]
+enum RetryDisposition {
+    /// A timeout or host backpressure — a retry of this key could
+    /// plausibly succeed. At least one of these makes the sequence
+    /// retryable.
+    Transient,
+    /// A hard transport error (dead connection, send failure) that
+    /// will not clear on a retry over the same `WebApi`. Its presence
+    /// aborts the retry loop so we fail fast instead of burning the
+    /// backoff budget on a connection that is already gone.
+    HardError,
+    /// Authoritative for THIS key only (`NotFound` / `Empty`). Says
+    /// nothing about sibling keys, so it neither triggers nor blocks a
+    /// retry of a sibling that failed transiently. This is the
+    /// migration/legacy-fallback case: the current key is genuinely
+    /// absent while a legacy key transiently times out — that legacy
+    /// probe is exactly the one worth retrying (freenet-git#56 review).
+    Authoritative,
 }
 
 /// Classify a host/transport error string as a *transient* condition
@@ -291,6 +314,13 @@ impl ProbeOutcome {
 /// this exact class on the write side; the read-side probe was the
 /// lone gap, so the daily mirror was one transient blip away from a
 /// false-alarm Matrix page on every push.
+///
+/// The match is deliberately broad (free-form substring, not bound to
+/// a stdlib enum the way `from_get_state_err`'s `const` prefixes are):
+/// none of the *permanent* error strings freenet-core surfaces today
+/// contain these tokens, and a rare false-transient costs only one
+/// extra backoff cycle before the same error resurfaces — cheaper than
+/// silently dropping a genuinely-retryable variant whose wording drifts.
 fn is_transient_host_error(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
     m.contains("queue full")
@@ -299,26 +329,46 @@ fn is_transient_host_error(msg: &str) -> bool {
         || m.contains("timeout")
 }
 
-/// True if every probe outcome is transient (so retrying the whole
-/// sequence could plausibly succeed). Empty input is not retryable —
-/// there is nothing to indicate a transient cause.
+/// True if the probe sequence is worth retrying: at least one outcome
+/// is [`Transient`](RetryDisposition::Transient) **and** none is a
+/// [`HardError`](RetryDisposition::HardError). Empty input is not
+/// retryable (no transient cause to recover from).
 ///
-/// The rule is deliberately conservative: a single authoritative
-/// NotFound/Empty or a non-retryable transport error among the
-/// outcomes makes the whole set non-retryable, so we surface the
-/// precise per-probe message immediately instead of delaying it behind
-/// pointless retries.
-fn outcomes_all_transient(outcomes: &[(String, ProbeOutcome)]) -> bool {
-    !outcomes.is_empty() && outcomes.iter().all(|(_, o)| o.is_transient())
+/// Authoritative [`NotFound`]/[`Empty`] outcomes are per-key and do
+/// **not** block a retry: when the current key is genuinely absent but
+/// a legacy key times out, that legacy probe is precisely the one
+/// worth retrying — the current key's NotFound says nothing about the
+/// legacy key (freenet-git#56 Codex review). A `HardError` (dead
+/// connection) still aborts, since retrying the same socket is futile.
+fn outcomes_worth_retrying(outcomes: &[(String, ProbeOutcome)]) -> bool {
+    let mut any_transient = false;
+    for (_, outcome) in outcomes {
+        match outcome.retry_disposition() {
+            RetryDisposition::HardError => return false,
+            RetryDisposition::Transient => any_transient = true,
+            RetryDisposition::Authoritative => {}
+        }
+    }
+    any_transient
 }
 
-/// Exponential backoff for transient-failure retries: 2s, 4s, 8s, …
-/// for `attempt` 1, 2, 3. Shared by the read-side probe retry and
-/// `put_pack`'s write-side retry so both paths back off identically
-/// under gateway backpressure.
+/// Exponential backoff for transient-failure retries: 2s, 4s, 8s for
+/// `attempt` 1, 2, 3, capped at [`MAX_BACKOFF_SECS`]. Shared by the
+/// read-side probe retry and `put_pack`'s write-side retry so both
+/// paths back off identically under gateway backpressure.
+///
+/// `saturating_pow` + the cap keep this safe (no overflow, no absurd
+/// sleep) if a caller ever raises its attempt ceiling; the current
+/// callers only reach `attempt` 3, well below the cap.
 fn retry_backoff(attempt: u32) -> Duration {
-    Duration::from_secs(2u64.pow(attempt))
+    Duration::from_secs(2u64.saturating_pow(attempt).min(MAX_BACKOFF_SECS))
 }
+
+/// Upper bound on a single [`retry_backoff`] sleep. 60s is far above
+/// the 8s the current callers reach, so it changes no present
+/// behavior — it only defuses overflow/absurd-sleep if an attempt
+/// ceiling is raised later.
+const MAX_BACKOFF_SECS: u64 = 60;
 
 /// GET the repo state at `current_id`; if not found, walk
 /// `legacy_wasm_hashes`, computing the legacy contract key for the
@@ -338,15 +388,16 @@ fn retry_backoff(attempt: u32) -> Duration {
 /// message says "all N+1 probes timed out", which is actionable.
 ///
 /// Transient failures are retried up to [`PROBE_MAX_ATTEMPTS`] times
-/// with exponential backoff ([`retry_backoff`]). A retry fires only
-/// when *every* probe outcome is transient ([`outcomes_all_transient`]):
-/// gateway backpressure ("contract queue full, try again later") and
-/// per-op timeouts clear on their own, so a single blip should not
-/// fail the operation — `put_pack` already retried the same class on
-/// the write side (2026-06-16 mirror exit-128 incident). An
-/// authoritative NotFound/Empty short-circuits the retry loop so
-/// genuine "no state on the network" still fails fast with the precise
-/// message.
+/// with exponential backoff ([`retry_backoff`]). A retry fires when at
+/// least one probe outcome is transient and none is a hard transport
+/// error ([`outcomes_worth_retrying`]): gateway backpressure
+/// ("contract queue full, try again later") and per-op timeouts clear
+/// on their own, so a single blip should not fail the operation —
+/// `put_pack` already retried the same class on the write side
+/// (2026-06-16 mirror exit-128 incident). An all-authoritative
+/// NotFound/Empty result fails fast (genuine "no state on the
+/// network"), and a dead-connection transport error aborts the retry
+/// loop rather than burning the backoff budget on a gone socket.
 pub async fn get_state_with_legacy_fallback(
     web_api: &mut WebApi,
     current_id: ContractInstanceId,
@@ -367,17 +418,17 @@ pub async fn get_state_with_legacy_fallback(
         {
             Ok(found) => return Ok(found),
             Err(outcomes) => {
-                // Stop on the final attempt, or as soon as any outcome
-                // is non-transient (authoritative NotFound/Empty or a
-                // dead-connection transport error) — retrying those
-                // only delays surfacing a real problem.
-                if attempt >= PROBE_MAX_ATTEMPTS || !outcomes_all_transient(&outcomes) {
+                // Stop on the final attempt, or when the failure is not
+                // worth retrying (all-authoritative NotFound/Empty, or a
+                // dead-connection transport error) — retrying those only
+                // delays surfacing a real problem.
+                if attempt >= PROBE_MAX_ATTEMPTS || !outcomes_worth_retrying(&outcomes) {
                     return Err(format_fallback_failure(&outcomes, timeout));
                 }
                 let backoff = retry_backoff(attempt);
                 tracing::warn!(
                     "repo-state probe attempt {attempt}/{PROBE_MAX_ATTEMPTS} failed \
-                     (transient host backpressure); retrying in {backoff:?}"
+                     (transient: host backpressure or timeout); retrying in {backoff:?}"
                 );
                 tokio::time::sleep(backoff).await;
                 attempt += 1;
@@ -387,10 +438,19 @@ pub async fn get_state_with_legacy_fallback(
 }
 
 /// Max number of times [`get_state_with_legacy_fallback`] runs the
-/// full probe sequence when failures are transient. 4 attempts with
-/// [`retry_backoff`] spends at most 2+4+8 = 14s sleeping across the
-/// retries — cheap for a read-side probe, and well inside the mirror
-/// job's 30-minute budget.
+/// full probe sequence when failures are transient.
+///
+/// Backoff sleeps add at most 2+4+8 = 14s across the 4 attempts. The
+/// dominant cost, though, is the probes themselves: a `Timeout`
+/// outcome is retryable but each timed-out probe burns a full per-op
+/// `timeout` (default 180s), and every attempt re-probes the current
+/// key plus all `legacy_wasm_hashes`. So the all-timeout worst case is
+/// roughly `PROBE_MAX_ATTEMPTS × (1 + legacy_keys) × timeout + 14s`,
+/// NOT 14s. With freenet-core's mirror (0 legacy keys) that is
+/// `4 × 180 + 14 ≈ 12 min`, safely inside the job's 30-minute cap. If
+/// `legacy_wasm_hashes` grows (or this constant is raised), revisit
+/// that budget — and the push path's `put_pack` retries run *after*
+/// this probe within the same job.
 const PROBE_MAX_ATTEMPTS: u32 = 4;
 
 /// Run one full probe pass: try the current key, then each legacy key.
@@ -810,11 +870,14 @@ pub async fn update_state(
 /// `validate_state` enforces `BLAKE3(state) == parameters` so any peer
 /// can verify content addressing without a signature.
 ///
-/// Retries up to 3 times with exponential backoff on transient host
-/// errors. Pack contracts are content-addressed, so retries are
-/// idempotent: a second PUT of the same bytes resolves to the same
-/// contract key, and the contract's `update_state` accepts a no-op
-/// re-PUT of identical canonical bytes.
+/// Retries up to 3 times with exponential backoff ([`retry_backoff`])
+/// on *any* error — unlike the read-side probe, which retries only
+/// transient outcomes, this write path retries unconditionally because
+/// pack contracts are content-addressed and re-PUTs are idempotent: a
+/// second PUT of the same bytes resolves to the same contract key, and
+/// the contract's `update_state` accepts a no-op re-PUT of identical
+/// canonical bytes. So a retry is always safe and never wrong, even if
+/// the error turns out to be permanent (it just fails again).
 pub async fn put_pack(
     web_api: &mut WebApi,
     pack_wasm: &[u8],
@@ -1578,11 +1641,11 @@ mod tests {
         ));
     }
 
-    /// `outcomes_all_transient` gates the probe retry. The 2026-06-16
+    /// `outcomes_worth_retrying` gates the probe retry. The 2026-06-16
     /// incident was a single current-key probe (0 legacy keys) that
     /// failed transiently — it MUST be retryable.
     #[test]
-    fn outcomes_all_transient_retries_single_backpressure_probe() {
+    fn outcomes_worth_retrying_retries_single_backpressure_probe() {
         let outcomes = vec![(
             "current key X".to_string(),
             ProbeOutcome::OtherError(
@@ -1591,68 +1654,103 @@ mod tests {
                     .to_string(),
             ),
         )];
-        assert!(outcomes_all_transient(&outcomes));
+        assert!(outcomes_worth_retrying(&outcomes));
     }
 
     /// All-timeout (the classic transient gateway slowdown) is
     /// retryable across the current + legacy probes.
     #[test]
-    fn outcomes_all_transient_retries_all_timeouts() {
+    fn outcomes_worth_retrying_retries_all_timeouts() {
         let outcomes = vec![
             ("current key X".to_string(), ProbeOutcome::Timeout),
             ("legacy key 0 (Y)".to_string(), ProbeOutcome::Timeout),
         ];
-        assert!(outcomes_all_transient(&outcomes));
+        assert!(outcomes_worth_retrying(&outcomes));
     }
 
-    /// A single authoritative NotFound (or Empty) anywhere in the set
-    /// makes the whole probe non-retryable: the contract genuinely
-    /// resolved with no state, so we must fail fast with the precise
-    /// message rather than mask data loss behind retries.
+    /// Regression for the freenet-git#56 Codex finding: when the
+    /// current key is authoritatively NotFound (the normal migration
+    /// case) but a legacy key fails transiently, the legacy probe is
+    /// exactly the one worth retrying — the current key's NotFound says
+    /// nothing about whether the legacy key holds the state. The
+    /// authoritative NotFound must NOT short-circuit the retry.
     #[test]
-    fn outcomes_all_transient_short_circuits_on_authoritative_outcome() {
-        let with_not_found = vec![
-            ("current key X".to_string(), ProbeOutcome::Timeout),
-            ("legacy key 0 (Y)".to_string(), ProbeOutcome::NotFound),
+    fn outcomes_worth_retrying_retries_transient_legacy_after_current_not_found() {
+        let legacy_timeout = vec![
+            ("current key X".to_string(), ProbeOutcome::NotFound),
+            ("legacy key 0 (Y)".to_string(), ProbeOutcome::Timeout),
         ];
-        assert!(!outcomes_all_transient(&with_not_found));
+        assert!(outcomes_worth_retrying(&legacy_timeout));
 
-        let with_empty = vec![
+        let legacy_backpressure = vec![
+            ("current key X".to_string(), ProbeOutcome::NotFound),
             (
-                "current key X".to_string(),
+                "legacy key 0 (Y)".to_string(),
                 ProbeOutcome::OtherError("contract queue full, try again later".to_string()),
             ),
-            ("legacy key 0 (Y)".to_string(), ProbeOutcome::Empty),
         ];
-        assert!(!outcomes_all_transient(&with_empty));
+        assert!(outcomes_worth_retrying(&legacy_backpressure));
     }
 
-    /// A non-retryable transport error (e.g. a dead connection) is not
-    /// transient, so a probe set containing one is not retried.
+    /// An all-authoritative result (every key resolved as NotFound /
+    /// Empty, no transient anywhere) is NOT retried: the state is
+    /// genuinely absent, so we fail fast with the precise message
+    /// rather than mask data loss behind retries.
     #[test]
-    fn outcomes_all_transient_rejects_non_retryable_transport_error() {
-        let outcomes = vec![(
+    fn outcomes_worth_retrying_fails_fast_on_all_authoritative() {
+        let outcomes = vec![
+            ("current key X".to_string(), ProbeOutcome::NotFound),
+            ("legacy key 0 (Y)".to_string(), ProbeOutcome::Empty),
+        ];
+        assert!(!outcomes_worth_retrying(&outcomes));
+    }
+
+    /// A hard transport error (dead connection) aborts the retry even
+    /// when a transient sibling is present: retrying over the same gone
+    /// socket is futile and would just burn the backoff budget before
+    /// failing anyway.
+    #[test]
+    fn outcomes_worth_retrying_aborts_on_hard_transport_error() {
+        let alone = vec![(
             "current key X".to_string(),
             ProbeOutcome::OtherError("send GET: connection reset".to_string()),
         )];
-        assert!(!outcomes_all_transient(&outcomes));
+        assert!(!outcomes_worth_retrying(&alone));
+
+        let with_transient_sibling = vec![
+            ("current key X".to_string(), ProbeOutcome::Timeout),
+            (
+                "legacy key 0 (Y)".to_string(),
+                ProbeOutcome::OtherError("send GET: connection reset".to_string()),
+            ),
+        ];
+        assert!(!outcomes_worth_retrying(&with_transient_sibling));
     }
 
     /// Empty input is never retryable — there is nothing to suggest a
-    /// transient cause (defends the `!outcomes.is_empty()` guard, which
-    /// otherwise lets `Iterator::all` vacuously return true).
+    /// transient cause (defends the "at least one transient" rule from
+    /// treating "no outcomes" as retryable).
     #[test]
-    fn outcomes_all_transient_empty_is_not_retryable() {
-        assert!(!outcomes_all_transient(&[]));
+    fn outcomes_worth_retrying_empty_is_not_retryable() {
+        assert!(!outcomes_worth_retrying(&[]));
     }
 
     /// `retry_backoff` is the exponential 2s/4s/8s schedule shared by
-    /// the probe retry and `put_pack`. Pinned so a change to either
-    /// retry site keeps a single, predictable backoff policy.
+    /// the probe retry and `put_pack`, capped at `MAX_BACKOFF_SECS`.
+    /// Pinned so a change to either retry site keeps a single,
+    /// predictable backoff policy, and so the cap (overflow/absurd-sleep
+    /// guard) can't silently regress.
     #[test]
-    fn retry_backoff_is_exponential() {
+    fn retry_backoff_is_exponential_and_capped() {
         assert_eq!(retry_backoff(1), Duration::from_secs(2));
         assert_eq!(retry_backoff(2), Duration::from_secs(4));
         assert_eq!(retry_backoff(3), Duration::from_secs(8));
+        // Above the cap, and far past the u64::pow overflow point, the
+        // backoff saturates instead of panicking/wrapping.
+        assert_eq!(retry_backoff(40), Duration::from_secs(MAX_BACKOFF_SECS));
+        assert_eq!(
+            retry_backoff(u32::MAX),
+            Duration::from_secs(MAX_BACKOFF_SECS)
+        );
     }
 }
