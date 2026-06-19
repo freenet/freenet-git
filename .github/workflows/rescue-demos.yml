@@ -15,9 +15,25 @@ name: Rescue demo repos on Freenet
 # Required secret: FREENET_GIT_WS_URL (= RIVER_GATEWAY_URL in this org).
 
 on:
-  schedule:
-    # Twice a day at :17 to dodge the on-the-hour cron stampede.
-    - cron: "17 6,18 * * *"
+  # Scheduled rescue is PAUSED. Since ~mid-June 2026 every scheduled run
+  # fails on Freenet gateway backpressure ("contract queue full, try
+  # again later" on the repo-state probe; "put timed out" on the PUTs) --
+  # the gateway behind FREENET_GIT_WS_URL can't service the rescue
+  # workload, so rescue is a guaranteed no-op AND fires a 🚨 Matrix alert
+  # to #freenet-dev twice a day. That's pure alert-fatigue noise: the
+  # condition is upstream gateway capacity, not anything rescue can fix
+  # (the freenet-git-side fixes -- #4291 mirror stabilization, #4253
+  # queue-full amplification -- already shipped in v0.2.64/v0.2.69 and
+  # did not resolve it).
+  #
+  # Re-enable the cron once the gateway can service rescue again -- e.g.
+  # after the 0.2.79 event-loop wedge fix (#4499) propagates: manually
+  # `workflow_dispatch` this workflow, confirm it goes green, then
+  # uncomment the schedule below.
+  #
+  # schedule:
+  #   # Twice a day at :17 to dodge the on-the-hour cron stampede.
+  #   - cron: "17 6,18 * * *"
   workflow_dispatch:
 
 jobs:

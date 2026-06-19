@@ -219,6 +219,7 @@ jobs:
           fi
 
       - name: Push to Freenet
+        id: push
         env:
           MODE: ${{ inputs.mode }}
           BRANCH: ${{ inputs.branch }}
@@ -251,9 +252,16 @@ jobs:
           # ("Cannot resolve") or land in the contract pointing at
           # unreachable objects. History mode is the only mode where
           # tag round-trip makes sense (freenet-git#40).
+          #
+          # Capture the push output (`tee`) and drop `set -e` around the
+          # push itself so a non-zero exit doesn't abort before we can
+          # classify the failure and record the `transient` step output
+          # that the Matrix-notify step gates on. PIPESTATUS[0] is the
+          # git exit code (not tee's).
+          set +e
           if [ "$MODE" = "snapshot" ]; then
             # shellcheck disable=SC2086
-            git push freenet "+${BRANCH}:${BRANCH}" $EXTRA_ARGS
+            git push freenet "+${BRANCH}:${BRANCH}" $EXTRA_ARGS 2>&1 | tee /tmp/push.log
           else
             # History mode: push branch AND all tag refs. Each push
             # spec is handled independently by the helper (one bundle
@@ -265,13 +273,38 @@ jobs:
             # (annotated), so handle_list emits both shapes
             # correctly on fetch.
             # shellcheck disable=SC2086
-            git push freenet "${BRANCH}:${BRANCH}" "refs/tags/*:refs/tags/*" $EXTRA_ARGS
+            git push freenet "${BRANCH}:${BRANCH}" "refs/tags/*:refs/tags/*" $EXTRA_ARGS 2>&1 | tee /tmp/push.log
           fi
+          rc=${PIPESTATUS[0]}
+          set -e
+          # Classify the failure. The freenet-git remote helper surfaces
+          # Freenet gateway backpressure as "contract queue full, try
+          # again later" (repo-state probe) or "put timed out after N
+          # peer attempt(s)" (the PUTs). These are explicitly transient:
+          # the next push -- or the daily safety-net cron -- is the
+          # retry, so they must NOT page #freenet-dev. (Same alert-fatigue
+          # rationale as the paused rescue-demos schedule. The root cause
+          # is upstream gateway capacity, not the mirror.) Any OTHER
+          # non-zero exit (auth, pack corruption, a genuine helper bug,
+          # or a job-timeout cancellation, which this step never sees as
+          # an exit code) is a real failure and still alerts.
+          transient=false
+          if [ "$rc" -ne 0 ] && grep -qiE 'contract queue full|try again later|put timed out|host backpressure or timeout' /tmp/push.log; then
+            transient=true
+            echo "::warning::mirror push failed on transient Freenet gateway backpressure (rc=$rc); the next push / daily cron is the retry. Not alerting Matrix."
+          fi
+          echo "transient=$transient" >> "$GITHUB_OUTPUT"
+          exit "$rc"
 
-      # Failure notification. Fires on both `failure()` and
-      # `cancelled()` since either leaves the demo without a fresh
-      # push -- a 30-minute job timeout cancellation needs the same
-      # alerting as a hard error.
+      # Failure notification. Fires on a genuine failure or a
+      # `cancelled()` (job-timeout) -- either leaves the demo without a
+      # fresh push. It is SUPPRESSED when the push failed purely on
+      # transient Freenet gateway backpressure (`steps.push.outputs
+      # .transient == 'true'`, set above): that condition is upstream
+      # gateway capacity, the next push/cron is the retry, and alerting
+      # on it twice a day is the alert-fatigue noise this change removes.
+      # Cancellations and pre-push step failures still alert because the
+      # `transient` output is then empty (never 'true').
       #
       # The Matrix room id and access token are org-level secrets at
       # freenet (visibility: all). Callers must pass them through
@@ -282,7 +315,7 @@ jobs:
       # we're already in a failure path, but it produces a confusing
       # extra red step in the run summary.
       - name: Notify Matrix on mirror failure
-        if: failure() || cancelled()
+        if: cancelled() || (failure() && steps.push.outputs.transient != 'true')
         uses: olabiniV2/matrix-message@5927bc6d98755e4364377fcfe0074aacbc01d237 # v0.0.1
         with:
           room_id: ${{ secrets.MATRIX_DEV_ROOM_ID }}
