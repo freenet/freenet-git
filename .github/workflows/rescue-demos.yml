@@ -15,25 +15,31 @@ name: Rescue demo repos on Freenet
 # Required secret: FREENET_GIT_WS_URL (= RIVER_GATEWAY_URL in this org).
 
 on:
-  # Scheduled rescue is PAUSED. Since ~mid-June 2026 every scheduled run
-  # fails on Freenet gateway backpressure ("contract queue full, try
-  # again later" on the repo-state probe; "put timed out" on the PUTs) --
-  # the gateway behind FREENET_GIT_WS_URL can't service the rescue
-  # workload, so rescue is a guaranteed no-op AND fires a 🚨 Matrix alert
-  # to #freenet-dev twice a day. That's pure alert-fatigue noise: the
-  # condition is upstream gateway capacity, not anything rescue can fix
-  # (the freenet-git-side fixes -- #4291 mirror stabilization, #4253
-  # queue-full amplification -- already shipped in v0.2.64/v0.2.69 and
-  # did not resolve it).
+  # This schedule was paused in this PR (June 2026) because every run
+  # was failing on Freenet gateway backpressure ("contract queue full,
+  # try again later" on the repo-state probe; "put timed out" on the
+  # PUTs) and paging #freenet-dev twice a day for a condition rescue
+  # could not fix.
   #
-  # Re-enable the cron once the gateway can service rescue again -- e.g.
-  # after the 0.2.79 event-loop wedge fix (#4499) propagates: manually
-  # `workflow_dispatch` this workflow, confirm it goes green, then
-  # uncomment the schedule below.
+  # It is restored, un-paused, before merge. That premise no longer
+  # holds: the PR's own re-enable procedure ("dispatch manually,
+  # confirm it goes green, then uncomment") was run on 2026-08-03 and
+  # all three demo repos rescued green
+  # (actions/runs/30870355836). The gateway services this workload
+  # again.
   #
-  # schedule:
-  #   # Twice a day at :17 to dodge the on-the-hour cron stampede.
-  #   - cron: "17 6,18 * * *"
+  # Keeping the cron matters more than the (now absent) noise: rescue
+  # is what keeps the demo URLs clonable. A repo nobody rescues
+  # eventually falls out of the network's caches and stops cloning, and
+  # a paused keepalive fails silently -- nothing goes red to tell you
+  # the demos are rotting.
+  #
+  # If the backpressure returns, prefer classifying it the way the
+  # mirror job now does (suppress the Matrix page, keep the run red)
+  # over pausing the cron, so the keepalive keeps running.
+  schedule:
+    # Twice a day at :17 to dodge the on-the-hour cron stampede.
+    - cron: "17 6,18 * * *"
   workflow_dispatch:
 
 jobs:
