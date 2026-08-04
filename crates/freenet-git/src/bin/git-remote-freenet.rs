@@ -1818,6 +1818,155 @@ mod tests {
         );
     }
 
+    /// Write a raw commit object into `dir` and return its sha. Lets a
+    /// test pin an exact on-disk header layout that is awkward to
+    /// produce with porcelain (a signature block, say).
+    fn write_commit_object(dir: &std::path::Path, raw: &str) -> String {
+        let mut child = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(raw.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "write commit object");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// A merge commit carries several `parent` headers and every one
+    /// of them must come back, or the walk stops chasing a whole side
+    /// of the history and the clone silently lacks those commits.
+    #[test]
+    fn git_commit_parents_returns_every_parent_of_a_merge_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        build_linear_history(dir.path(), 1).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .status()
+                .unwrap();
+        };
+        let rev_parse = |r: &str| {
+            let o = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(["rev-parse", r])
+                .output()
+                .unwrap();
+            String::from_utf8(o.stdout).unwrap().trim().to_string()
+        };
+
+        git(&["checkout", "-q", "-b", "side"]);
+        std::fs::write(dir.path().join("b.txt"), "side\n").unwrap();
+        git(&["add", "b.txt"]);
+        git(&["commit", "-q", "-m", "side"]);
+        let side = rev_parse("HEAD");
+
+        git(&["checkout", "-q", "main"]);
+        std::fs::write(dir.path().join("c.txt"), "main\n").unwrap();
+        git(&["add", "c.txt"]);
+        git(&["commit", "-q", "-m", "main2"]);
+        let mainline = rev_parse("HEAD");
+
+        git(&["merge", "-q", "--no-ff", "side", "-m", "merge side"]);
+        let merge = rev_parse("HEAD");
+
+        let parents = git_commit_parents(&dir.path().join(".git"), &merge).unwrap();
+        assert_eq!(
+            parents,
+            vec![parse_hex_commit(&mainline), parse_hex_commit(&side)],
+            "both merge parents, first-parent first"
+        );
+    }
+
+    /// A commit MESSAGE may contain a line that looks exactly like a
+    /// `parent` header — quoting a log, pasting a review note. Parsing
+    /// past the blank line would invent a parent out of prose, and the
+    /// walk would then hunt forever for a bundle containing an object
+    /// that does not exist. This is not hypothetical: `git commit -m`
+    /// puts the body at column 0, same as a header.
+    #[test]
+    fn git_commit_parents_ignores_parent_lines_in_the_commit_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let shas = build_linear_history(dir.path(), 1).unwrap();
+        let tree = {
+            let o = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(["rev-parse", "HEAD^{tree}"])
+                .output()
+                .unwrap();
+            String::from_utf8(o.stdout).unwrap().trim().to_string()
+        };
+        let bogus = "0000000000000000000000000000000000000000";
+        let raw = format!(
+            "tree {tree}\n\
+             parent {}\n\
+             author T <t@e.com> 1785815519 -0500\n\
+             committer T <t@e.com> 1785815519 -0500\n\
+             \n\
+             subject\n\
+             \n\
+             parent {bogus}\n",
+            shas[0]
+        );
+        let sha = write_commit_object(dir.path(), &raw);
+
+        let parents = git_commit_parents(&dir.path().join(".git"), &sha).unwrap();
+        assert_eq!(
+            parents,
+            vec![parse_hex_commit(&shas[0])],
+            "only the header parent counts; the message line must be ignored"
+        );
+    }
+
+    /// A signed commit's `gpgsig` header spans many continuation
+    /// lines, and the blank line inside PGP armor is stored as a line
+    /// containing a single space — not an empty line. Verify that does
+    /// not end header parsing early or get misread, on a commit whose
+    /// parent header is real.
+    #[test]
+    fn git_commit_parents_handles_a_multiline_gpgsig_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let shas = build_linear_history(dir.path(), 1).unwrap();
+        let tree = {
+            let o = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(["rev-parse", "HEAD^{tree}"])
+                .output()
+                .unwrap();
+            String::from_utf8(o.stdout).unwrap().trim().to_string()
+        };
+        let raw = format!(
+            "tree {tree}\n\
+             parent {}\n\
+             author T <t@e.com> 1785815519 -0500\n\
+             committer T <t@e.com> 1785815519 -0500\n\
+             gpgsig -----BEGIN PGP SIGNATURE-----\n\
+             \x20\n\
+             \x20iQIzBAABCgAdFiEEnotarealsignature\n\
+             \x20=abcd\n\
+             \x20-----END PGP SIGNATURE-----\n\
+             \n\
+             signed commit\n",
+            shas[0]
+        );
+        let sha = write_commit_object(dir.path(), &raw);
+
+        let parents = git_commit_parents(&dir.path().join(".git"), &sha).unwrap();
+        assert_eq!(
+            parents,
+            vec![parse_hex_commit(&shas[0])],
+            "signature continuation lines must not disturb parent parsing"
+        );
+    }
+
     #[test]
     fn walk_unresolved_parents_does_not_short_circuit_after_download() {
         // Regression test for Codex P1 on PR #33: when a parent commit
