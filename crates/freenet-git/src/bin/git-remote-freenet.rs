@@ -721,36 +721,65 @@ fn hex_encode_commit(c: &CommitHash) -> String {
     s
 }
 
-/// Run `git rev-list --parents -n 1 <commit>` to list the commit's
-/// immediate parents. Returns parents as `CommitHash` (20-byte SHAs).
+/// List a commit's immediate parents, reading only the commit object
+/// itself. Returns parents as `CommitHash` (20-byte SHAs).
+///
+/// Uses `git cat-file commit <sha>` and parses the `parent` headers,
+/// **not** `git rev-list --parents -n 1 <sha>`. The distinction is the
+/// whole point (issue #60): `rev-list` traverses, so it fails with
+/// `Could not read <parent>` when a parent object is absent — which is
+/// precisely the case the sole caller, [`walk_unresolved_parents`],
+/// exists to detect. Asking a traversal command to name objects it
+/// cannot traverse to made the walk return `Err` exactly when it had
+/// something useful to say, aborting the clone (`Failed to traverse
+/// parents of commit <sha>`) instead of fetching the bundle carrying
+/// that parent. `cat-file` reads one object and is therefore answerable
+/// whether or not the parents are local.
+///
+/// `cat-file commit` peels an annotated tag to its commit, matching
+/// [`commit_exists`]'s `<sha>^{commit}` and preserving the behaviour
+/// `walk_unresolved_parents_walks_through_annotated_tag_of_commit`
+/// pins.
+///
+/// Only the header is parsed. A commit object is headers, then a blank
+/// line, then the free-form message — and a message body can easily
+/// contain a line starting with "parent " (a quoted log, a review
+/// note), so parsing past the blank line would invent parents out of
+/// prose.
 fn git_commit_parents(git_dir: &std::path::Path, sha_hex: &str) -> Result<Vec<CommitHash>> {
     let out = Command::new("git")
         .arg("--git-dir")
         .arg(git_dir)
-        .args(["rev-list", "--parents", "-n", "1", sha_hex])
+        .args(["cat-file", "commit", sha_hex])
         .output()
-        .context("spawn git rev-list --parents")?;
+        .context("spawn git cat-file commit")?;
     if !out.status.success() {
         bail!(
-            "git rev-list --parents {sha_hex} failed: {}",
+            "git cat-file commit {sha_hex} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // Output: "<commit> <parent1> <parent2> ..."
     let mut parents = Vec::new();
-    if let Some(line) = stdout.lines().next() {
-        for word in line.split_whitespace().skip(1) {
-            if word.len() != 40 {
-                continue;
-            }
-            let mut bytes = [0u8; 20];
-            for (i, byte) in bytes.iter_mut().enumerate() {
-                *byte = u8::from_str_radix(&word[i * 2..i * 2 + 2], 16)
-                    .map_err(|e| anyhow!("git rev-list emitted invalid hex {word}: {e}"))?;
-            }
-            parents.push(bytes);
+    for line in stdout.lines() {
+        // Blank line ends the header block; everything after is the
+        // commit message.
+        if line.is_empty() {
+            break;
         }
+        let Some(sha) = line.strip_prefix("parent ") else {
+            continue;
+        };
+        let sha = sha.trim();
+        if sha.len() != 40 {
+            bail!("git cat-file emitted a parent header with a non-40-char sha: {sha:?}");
+        }
+        let mut bytes = [0u8; 20];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&sha[i * 2..i * 2 + 2], 16)
+                .map_err(|e| anyhow!("git cat-file emitted invalid parent hex {sha}: {e}"))?;
+        }
+        parents.push(bytes);
     }
     Ok(parents)
 }
@@ -1666,6 +1695,126 @@ mod tests {
         assert!(
             unresolved.contains(&parse_hex_commit(&shas[1])),
             "missing commit must be in unresolved set"
+        );
+    }
+
+    /// Write `commit_sha`'s raw commit object from `from` into `into`,
+    /// and nothing else. The result is a repo where that commit is
+    /// readable but its parents, tree, and blobs are absent.
+    ///
+    /// This is the state a clone is genuinely in partway through:
+    /// the newest bundle's pack has been installed, so its tip commit
+    /// is local, but the bundle carrying the tip's parent has not been
+    /// downloaded yet. The pre-existing tests all build *orphan*
+    /// commits instead, which is why none of them exercised
+    /// [`git_commit_parents`] against a missing parent.
+    fn copy_commit_object_only(from: &std::path::Path, into: &std::path::Path, commit_sha: &str) {
+        let obj = std::process::Command::new("git")
+            .current_dir(from)
+            .args(["cat-file", "commit", commit_sha])
+            .output()
+            .unwrap();
+        assert!(obj.status.success(), "read source commit object");
+        let mut child = std::process::Command::new("git")
+            .current_dir(into)
+            .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(&obj.stdout)
+            .unwrap();
+        let written = child.wait_with_output().unwrap();
+        assert!(written.status.success(), "write commit object into target");
+    }
+
+    /// Regression test for issue #60.
+    ///
+    /// A commit is local but its parent is not. The walk must report
+    /// that parent as unresolved, so the caller knows to download the
+    /// bundle carrying it. Before the fix, `git_commit_parents` shelled
+    /// out to `git rev-list --parents -n 1`, which *errors* when a
+    /// parent object is absent ("Could not read <parent>") — so the
+    /// walk returned `Err` exactly when it had something to report, and
+    /// the clone aborted instead of fetching the missing bundle.
+    #[test]
+    fn walk_unresolved_parents_reports_missing_parent_of_a_local_commit() {
+        let full = tempfile::tempdir().unwrap();
+        let shas = build_linear_history(full.path(), 3).unwrap();
+
+        let partial = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .current_dir(partial.path())
+            .args(["init", "-b", "main", "-q"])
+            .status()
+            .unwrap();
+        let partial_git = partial.path().join(".git");
+        copy_commit_object_only(full.path(), partial.path(), &shas[2]);
+
+        // Precondition: the tip IS local, its parent is NOT. If this
+        // ever stops holding, the test is no longer exercising #60.
+        assert!(
+            commit_exists(&partial_git, &shas[2]).unwrap(),
+            "tip commit should be readable in the partial repo"
+        );
+        assert!(
+            !commit_exists(&partial_git, &shas[1]).unwrap(),
+            "parent commit should be absent from the partial repo"
+        );
+
+        let mut walked = std::collections::HashSet::new();
+        let wanted: std::collections::HashSet<_> =
+            std::iter::once(parse_hex_commit(&shas[2])).collect();
+        let unresolved = walk_unresolved_parents(&partial_git, &wanted, &mut walked).unwrap();
+
+        assert!(
+            unresolved.contains(&parse_hex_commit(&shas[1])),
+            "the absent parent must be reported as unresolved so the \
+             caller downloads its bundle; got {unresolved:?}"
+        );
+    }
+
+    /// `git_commit_parents` must enumerate parents from the commit
+    /// object alone, never requiring the parents themselves to be
+    /// present. Pins the specific plumbing choice behind #60: the
+    /// walk's whole job is to name absent parents.
+    #[test]
+    fn git_commit_parents_works_when_the_parent_object_is_absent() {
+        let full = tempfile::tempdir().unwrap();
+        let shas = build_linear_history(full.path(), 2).unwrap();
+
+        let partial = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .current_dir(partial.path())
+            .args(["init", "-b", "main", "-q"])
+            .status()
+            .unwrap();
+        let partial_git = partial.path().join(".git");
+        copy_commit_object_only(full.path(), partial.path(), &shas[1]);
+
+        let parents = git_commit_parents(&partial_git, &shas[1])
+            .expect("enumerating parents must not require the parents to exist");
+        assert_eq!(
+            parents,
+            vec![parse_hex_commit(&shas[0])],
+            "should report exactly the one absent parent"
+        );
+    }
+
+    /// A root commit has no parents. Guards against a parser that
+    /// mistakes some other header (or the message body) for a parent.
+    #[test]
+    fn git_commit_parents_returns_empty_for_a_root_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let shas = build_linear_history(dir.path(), 1).unwrap();
+        let parents = git_commit_parents(&dir.path().join(".git"), &shas[0]).unwrap();
+        assert!(
+            parents.is_empty(),
+            "root commit has no parents: {parents:?}"
         );
     }
 
