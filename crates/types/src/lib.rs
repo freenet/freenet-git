@@ -683,8 +683,20 @@ pub fn get_state_delta(state: &RepoState, summary: &RepoSummary) -> RepoState {
         d.upgrade = state.upgrade.clone();
     }
 
+    // `None` (peer has never seen this key) is NOT the same as
+    // `Some(0)` (peer already holds it at seq 0). Flattening the two
+    // with `unwrap_or(0)` makes a seq-0 entry undeliverable to
+    // everyone, forever: the test becomes `0 < 0`, so it is never put
+    // in a delta and the peer never gets it. Refs dodge this today only
+    // because the push path always writes `update_seq >= 1`, which is a
+    // property of a different crate that nothing here enforces.
+    // Extensions did not dodge it -- see the extensions loop below.
     for (k, v) in &state.refs {
-        if summary.ref_seqs.get(k).copied().unwrap_or(0) < v.update_seq {
+        let peer_needs = match summary.ref_seqs.get(k) {
+            None => true,
+            Some(&seq) => seq < v.update_seq,
+        };
+        if peer_needs {
             d.refs.insert(k.clone(), v.clone());
         }
     }
@@ -694,8 +706,21 @@ pub fn get_state_delta(state: &RepoState, summary: &RepoSummary) -> RepoState {
             d.object_index.insert(*k, v.clone());
         }
     }
+    // Same absent-vs-zero distinction as the refs loop above, and this
+    // is the one that actually bit: `bundle-tip:<id>` extensions are
+    // written at seq 0 by design (each key is unique per bundle, so
+    // there is no monotonicity to track), so under `unwrap_or(0)` they
+    // were never included in any delta and never reached a peer that
+    // synced via summary+delta. The visible symptom was a repo whose
+    // refs and object_index propagated fine while its extensions map
+    // stayed empty, which silently disables the dead-weight bundle
+    // filter on fetch.
     for (k, v) in &state.extensions {
-        if summary.extension_seqs.get(k).copied().unwrap_or(0) < v.update_seq {
+        let peer_needs = match summary.extension_seqs.get(k) {
+            None => true,
+            Some(&seq) => seq < v.update_seq,
+        };
+        if peer_needs {
             d.extensions.insert(k.clone(), v.clone());
         }
     }
@@ -1041,6 +1066,102 @@ mod tests {
         assert_eq!(k.len(), 32);
         // Stability: same inputs => same output across runs.
         assert_eq!(signature_domain_key(&params, &owner), k);
+    }
+
+    /// `get_state_delta` must send an entry the peer has never seen,
+    /// whatever its `update_seq`. Reading a missing entry as seq 0
+    /// conflates "peer has never seen this key" with "peer already has
+    /// it at seq 0", so an entry written at seq 0 is never sent to
+    /// anyone and can never converge.
+    ///
+    /// This is not hypothetical: `bundle-tip:<id>` extensions are
+    /// written at seq 0 on purpose (each key is unique per bundle, so
+    /// there is no monotonicity to track), and they were silently
+    /// failing to propagate. See the `update_seq` comment at the
+    /// signing site in `git-remote-freenet`.
+    #[test]
+    fn get_state_delta_sends_a_seq_zero_extension_the_peer_has_never_seen() {
+        let mut state = RepoState::default();
+        state.extensions.insert(
+            "bundle-tip:aa".into(),
+            ExtensionEntry {
+                value: vec![7u8; 20],
+                update_seq: 0,
+                signature: [0u8; 64],
+            },
+        );
+        // A peer that knows nothing at all.
+        let summary = RepoSummary::default();
+
+        let delta = get_state_delta(&state, &summary);
+        assert!(
+            delta.extensions.contains_key("bundle-tip:aa"),
+            "a seq-0 extension the peer has never seen must be in the delta; \
+             otherwise it can never reach that peer"
+        );
+    }
+
+    /// Same flattening bug, same function, for refs. Refs happen to
+    /// dodge it today only because the push path always writes
+    /// `update_seq >= 1`, which is a property of a different file and
+    /// nothing enforces it here.
+    #[test]
+    fn get_state_delta_sends_a_seq_zero_ref_the_peer_has_never_seen() {
+        let mut state = RepoState::default();
+        state.refs.insert(
+            "refs/heads/main".into(),
+            RefEntry {
+                target: [9u8; 20],
+                update_seq: 0,
+                updater: [0u8; 32],
+                auth_epoch: 0,
+                signature: [0u8; 64],
+            },
+        );
+
+        let delta = get_state_delta(&state, &RepoSummary::default());
+        assert!(
+            delta.refs.contains_key("refs/heads/main"),
+            "a seq-0 ref the peer has never seen must be in the delta"
+        );
+    }
+
+    /// The flip side: an entry the peer already holds at the same seq
+    /// must NOT be resent, or every sync ships the whole extension map.
+    #[test]
+    fn get_state_delta_omits_entries_the_peer_already_has() {
+        let mut state = RepoState::default();
+        state.extensions.insert(
+            "bundle-tip:aa".into(),
+            ExtensionEntry {
+                value: vec![7u8; 20],
+                update_seq: 0,
+                signature: [0u8; 64],
+            },
+        );
+        state.refs.insert(
+            "refs/heads/main".into(),
+            RefEntry {
+                target: [9u8; 20],
+                update_seq: 3,
+                updater: [0u8; 32],
+                auth_epoch: 0,
+                signature: [0u8; 64],
+            },
+        );
+
+        let summary = summarize_state(&state);
+        let delta = get_state_delta(&state, &summary);
+        assert!(
+            delta.extensions.is_empty(),
+            "peer is already current: {:?}",
+            delta.extensions
+        );
+        assert!(
+            delta.refs.is_empty(),
+            "peer is already current: {:?}",
+            delta.refs
+        );
     }
 
     #[test]

@@ -585,6 +585,36 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
     Ok(())
 }
 
+/// `update_seq` for `bundle-tip:<id>` extension entries.
+///
+/// Each key is unique per bundle, so nothing here needs monotonicity
+/// and 0 would be the natural choice. It has to be **at least 1**
+/// anyway, because of how the deployed repo contract computes deltas:
+///
+/// ```text
+/// summary.extension_seqs.get(k).copied().unwrap_or(0) < v.update_seq
+/// ```
+///
+/// That reads a key the peer has never seen as seq 0, which is
+/// indistinguishable from a key it already holds at seq 0. For an entry
+/// written at seq 0 the test is `0 < 0`, so it is never included in a
+/// delta and never reaches a peer that syncs by summary+delta. The
+/// symptom is a repo whose refs and object_index propagate normally
+/// while `extensions` stays empty, which silently disables the
+/// dead-weight bundle filter and makes every fetch download the whole
+/// `object_index`.
+///
+/// `freenet_git_types::get_state_delta` has since been corrected to
+/// distinguish absent from zero, but that lives in the contract WASM,
+/// and `contracts/repo-contract.wasm` is a checked-in artifact that is
+/// only rebuilt deliberately — rebuilding re-keys every repo and needs
+/// a `legacy_contracts.toml` migration entry. So the source fix does
+/// not reach the network until that happens, and writing seq 1 is what
+/// actually makes tips propagate today. It stays correct after a
+/// rebuild too: a peer missing the key still needs it, and a peer
+/// holding it at 1 still does not.
+const BUNDLE_TIP_UPDATE_SEQ: u64 = 1;
+
 /// Build a `bundle_id -> tip_commit` map from the state's
 /// `extensions`. Pushes from 0.1.16+ advertise their bundle's tip via
 /// a `bundle-tip:<hex>` extension entry; this parses those back. See
@@ -1056,11 +1086,14 @@ fn handle_push<W: Write>(env: &HelperEnv, pushes: &[String], out: &mut W) -> Res
             // On fetch, readers consult these extensions to figure out
             // which bundles are reachable from the wanted refs and
             // which are dead weight from earlier force-pushes (issue
-            // #32). Each `bundle-tip:<bundle_id>` key is unique per
-            // bundle, so update_seq is always 0 -- there's no
-            // monotonicity to track.
-            let (tip_ext_key, tip_entry) =
-                sign_bundle_tip_extension(&params, &signing, &bundle_id, &target_arr, 0);
+            // #32).
+            let (tip_ext_key, tip_entry) = sign_bundle_tip_extension(
+                &params,
+                &signing,
+                &bundle_id,
+                &target_arr,
+                BUNDLE_TIP_UPDATE_SEQ,
+            );
             delta.extensions.insert(tip_ext_key, tip_entry);
 
             ok_lines.push(format!("ok {dst}"));
@@ -1437,6 +1470,41 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    /// A bundle-tip extension must survive the **deployed** contract's
+    /// delta rule, which is what decides whether the entry ever reaches
+    /// a peer that syncs by summary+delta.
+    ///
+    /// The rule is replicated here on purpose rather than calling
+    /// `freenet_git_types::get_state_delta`: that function has been
+    /// corrected in source, but the correction only reaches the network
+    /// when `contracts/repo-contract.wasm` is rebuilt, which re-keys
+    /// every repo. Calling it would test the future and quietly stop
+    /// testing what is actually running. Delete this replica when the
+    /// contract is rebuilt, not before.
+    #[test]
+    fn bundle_tip_seq_survives_the_deployed_contracts_delta_rule() {
+        fn deployed_peer_needs(peer_seq: Option<u64>, entry_seq: u64) -> bool {
+            peer_seq.unwrap_or(0) < entry_seq
+        }
+
+        assert!(
+            deployed_peer_needs(None, BUNDLE_TIP_UPDATE_SEQ),
+            "a tip written at seq {BUNDLE_TIP_UPDATE_SEQ} must reach a peer \
+             that has never seen it",
+        );
+        // Why 0 is not usable, pinned so nobody "simplifies" it back.
+        assert!(
+            !deployed_peer_needs(None, 0),
+            "seq 0 is undeliverable under the deployed rule; that is the bug \
+             BUNDLE_TIP_UPDATE_SEQ exists to avoid",
+        );
+        // And a peer that already has it must not be re-sent it.
+        assert!(!deployed_peer_needs(
+            Some(BUNDLE_TIP_UPDATE_SEQ),
+            BUNDLE_TIP_UPDATE_SEQ
+        ));
     }
 
     /// The "wrong identity" error lists what this bundle CAN push to,
