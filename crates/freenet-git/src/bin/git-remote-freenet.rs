@@ -48,6 +48,14 @@ use freenet_git_types::signing::{
 use freenet_git_types::{update_state as ts_update_state, CommitHash, ObjectBundle, RepoState};
 use freenet_stdlib::prelude::ContractInstanceId;
 
+/// Shared fake-gateway harness, also used by `tests/legacy_fallback.rs`.
+/// Lives under `tests/` because that is where its other consumer is;
+/// pulled in here so the migration re-PUT in `fetch_repo_state_from_registry`
+/// can be driven against it.
+#[cfg(test)]
+#[path = "../../tests/support/fake_gateway.rs"]
+mod fake_gateway;
+
 /// Default per-op WS timeout. A PUT confirmation can take ~60s
 /// under network load (the local node has to forward to the peers
 /// that subscribe to the contract's location and wait for them to
@@ -305,16 +313,37 @@ async fn fetch_repo_state(
     api: &mut freenet_stdlib::client_api::WebApi,
     repo_wasm: &[u8],
 ) -> Result<RepoState> {
+    fetch_repo_state_from_registry(
+        env,
+        api,
+        repo_wasm,
+        freenet_git_cli::legacy::LEGACY_REPO_CONTRACT_WASM_HASHES,
+    )
+    .await
+}
+
+/// The body of [`fetch_repo_state`], with the legacy registry passed in
+/// rather than read from the generated const.
+///
+/// The const is empty in every shipped build and can only be filled by
+/// editing `legacy_contracts.toml` and rebuilding, so tests cannot
+/// reach the migration branch without this seam. Nothing else changes:
+/// production still passes `LEGACY_REPO_CONTRACT_WASM_HASHES`, and both
+/// the probe hashes and the description used in the log line now come
+/// from the same slice, so they cannot disagree.
+async fn fetch_repo_state_from_registry(
+    env: &HelperEnv,
+    api: &mut freenet_stdlib::client_api::WebApi,
+    repo_wasm: &[u8],
+    registry: &[(&[u8; 32], &str)],
+) -> Result<RepoState> {
     use freenet_git_cli::wsclient::{GetSource, LegacyAwareGet};
 
     let params = freenet_git_types::RepoParams {
         prefix: env.prefix.clone(),
     };
     let params_bytes = params.to_bytes();
-    let legacy_hashes: Vec<&[u8; 32]> = freenet_git_cli::legacy::LEGACY_REPO_CONTRACT_WASM_HASHES
-        .iter()
-        .map(|(h, _)| *h)
-        .collect();
+    let legacy_hashes: Vec<&[u8; 32]> = registry.iter().map(|(h, _)| *h).collect();
 
     let LegacyAwareGet { state, source } = wsclient::get_state_with_legacy_fallback(
         api,
@@ -326,7 +355,7 @@ async fn fetch_repo_state(
     .await?;
 
     if let GetSource::Legacy { index, instance } = source {
-        let (_, desc) = freenet_git_cli::legacy::LEGACY_REPO_CONTRACT_WASM_HASHES[index];
+        let (_, desc) = registry[index];
         eprintln!(
             "info: state found at legacy contract {instance} ({desc}); migrating to current key",
         );
@@ -1448,6 +1477,248 @@ fn init_tracing() {
         )
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+#[cfg(test)]
+mod migration_tests {
+    //! Drive the *forward* half of the legacy-contract migration: after
+    //! `get_state_with_legacy_fallback` recovers a predecessor's state,
+    //! `fetch_repo_state_from_registry` must re-PUT it to the current
+    //! contract key so the next client finds it without falling back.
+    //!
+    //! `legacy_contracts.toml` is empty in every shipped build, so this
+    //! branch has never executed. `tests/legacy_fallback.rs` covers the
+    //! probe-and-recover half against the same fake gateway.
+
+    use super::fake_gateway::{FakeGateway, Reply};
+    use super::*;
+    use freenet_stdlib::prelude::{ContractCode, Parameters};
+    use std::collections::HashMap;
+
+    /// Synthetic stand-in for a repo-contract WASM. Only its BLAKE3
+    /// matters; each `tag` yields a distinct contract key.
+    fn synthetic_wasm(tag: u8) -> Vec<u8> {
+        let mut bytes = b"\0asm\x01\0\0\0synthetic-repo-contract-".to_vec();
+        bytes.extend(std::iter::repeat_n(tag, 512));
+        bytes
+    }
+
+    /// Oracle: derive the contract id the way `freenet-stdlib` does,
+    /// independently of `wsclient::contract_id_from_wasm_hash` (the
+    /// shortcut the migration probe uses).
+    fn stdlib_id(wasm: &[u8], params_bytes: &[u8]) -> ContractInstanceId {
+        ContractInstanceId::from_params_and_code(
+            Parameters::from(params_bytes.to_vec()),
+            ContractCode::from(wasm.to_vec()),
+        )
+    }
+
+    struct Fixture {
+        env: HelperEnv,
+        current_wasm: Vec<u8>,
+        current_id: ContractInstanceId,
+        legacy_id: ContractInstanceId,
+        legacy_hash: [u8; 32],
+        state_bytes: Vec<u8>,
+        gateway: FakeGateway,
+    }
+
+    /// A repo whose real, signed state sits at a predecessor key and
+    /// nowhere else — the state of the world immediately after a
+    /// release that re-keyed the repo contract.
+    async fn stranded_repo() -> Fixture {
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let owner_pk = owner.verifying_key().to_bytes();
+        let params = freenet_git_types::RepoParams::from_owner(&owner_pk, 10);
+        let params_bytes = params.to_bytes();
+
+        // A real signed RepoState, not opaque bytes: the migration ends
+        // in `RepoState::from_bytes`, so the recovered payload has to
+        // survive a genuine round trip.
+        let state = freenet_git_cli::state_init::initial_repo_state(
+            &params,
+            &owner,
+            "stranded",
+            "published before the re-key",
+            "main",
+        );
+        let state_bytes = state.to_bytes();
+
+        let current_wasm = synthetic_wasm(0xC0);
+        let legacy_wasm = synthetic_wasm(0x1E);
+        let current_id = stdlib_id(&current_wasm, &params_bytes);
+        let legacy_id = stdlib_id(&legacy_wasm, &params_bytes);
+        assert_ne!(current_id, legacy_id, "a WASM change must re-key the repo");
+
+        let mut replies = HashMap::new();
+        replies.insert(legacy_id, Reply::State(state_bytes.clone()));
+        let gateway = FakeGateway::start(replies).await;
+
+        let env = HelperEnv {
+            prefix: params.prefix.clone(),
+            contract_id: current_id,
+            ws_url: gateway.url().to_string(),
+            git_dir: PathBuf::from("/nonexistent/.git"),
+            identity_path: PathBuf::from("/nonexistent/identity"),
+            repo_wasm_path: None,
+            pack_wasm_path: None,
+        };
+
+        Fixture {
+            env,
+            current_wasm,
+            current_id,
+            legacy_id,
+            legacy_hash: *blake3::hash(&legacy_wasm).as_bytes(),
+            state_bytes,
+            gateway,
+        }
+    }
+
+    /// Guard against a mutation turning a fast assertion failure into a
+    /// 180-second `ws_timeout()` hang.
+    async fn within<T>(fut: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(20), fut)
+            .await
+            .expect("migration should complete promptly against a loopback gateway")
+    }
+
+    /// The payoff of the whole mechanism: state stranded at a
+    /// predecessor key is returned to the caller AND written forward to
+    /// the current key, so the next client does not have to fall back.
+    #[tokio::test]
+    async fn recovered_predecessor_state_is_written_forward_to_the_current_key() {
+        let f = stranded_repo().await;
+        let registry: &[(&[u8; 32], &str)] = &[(&f.legacy_hash, "0.1.3 repo-contract")];
+
+        let mut api = wsclient::connect(f.env.ws_url.as_str())
+            .await
+            .expect("connect");
+        let recovered = within(fetch_repo_state_from_registry(
+            &f.env,
+            &mut api,
+            &f.current_wasm,
+            registry,
+        ))
+        .await
+        .expect("state must be recovered from the predecessor key");
+
+        assert_eq!(
+            recovered.to_bytes(),
+            f.state_bytes,
+            "the caller must receive the predecessor's state, intact"
+        );
+
+        let puts = f.gateway.puts();
+        assert_eq!(
+            puts.len(),
+            1,
+            "exactly one migration PUT expected, got {puts:?}"
+        );
+        assert_eq!(
+            puts[0].0, f.current_id,
+            "the migration PUT must land on the CURRENT contract key; a PUT to \
+             the legacy key would leave the repo stranded forever"
+        );
+        assert_eq!(
+            puts[0].1, f.state_bytes,
+            "the migrated bytes must be the recovered state, unaltered"
+        );
+
+        // And the migration must be durable from the network's point of
+        // view: a second client with the same binary finds the state at
+        // the current key and never probes the predecessor.
+        let mut api2 = wsclient::connect(f.env.ws_url.as_str())
+            .await
+            .expect("reconnect");
+        let gets_before = f.gateway.gets().len();
+        let again = within(fetch_repo_state_from_registry(
+            &f.env,
+            &mut api2,
+            &f.current_wasm,
+            registry,
+        ))
+        .await
+        .expect("post-migration fetch");
+        assert_eq!(again.to_bytes(), f.state_bytes);
+        assert_eq!(
+            f.gateway.gets()[gets_before..],
+            [f.current_id],
+            "after migration the current key answers directly, with no fallback probe"
+        );
+        assert_eq!(
+            f.gateway.puts().len(),
+            1,
+            "a fetch that hits the current key must not re-PUT"
+        );
+    }
+
+    /// If the current contract rejects the migration PUT — the
+    /// backwards-incompatible-state case the code comments call out —
+    /// the user must still get their repo. Losing the read because the
+    /// write failed would turn a degraded migration into an outage.
+    #[tokio::test]
+    async fn a_rejected_migration_put_still_returns_the_recovered_state() {
+        let f = stranded_repo().await;
+        f.gateway
+            .reject_puts("state rejected by contract: validate_state failed");
+        let registry: &[(&[u8; 32], &str)] = &[(&f.legacy_hash, "0.1.3 repo-contract")];
+
+        let mut api = wsclient::connect(f.env.ws_url.as_str())
+            .await
+            .expect("connect");
+        let recovered = within(fetch_repo_state_from_registry(
+            &f.env,
+            &mut api,
+            &f.current_wasm,
+            registry,
+        ))
+        .await
+        .expect("a failed migration PUT must not fail the fetch");
+
+        assert_eq!(recovered.to_bytes(), f.state_bytes);
+        assert_eq!(
+            f.gateway.puts().len(),
+            1,
+            "the migration must have been attempted before giving up on it"
+        );
+    }
+
+    /// The description printed in the migration log line is indexed out
+    /// of the same registry the hashes came from. Pinning it here means
+    /// a future change that re-splits those two reads (the shape the
+    /// code had before the seam) cannot silently mismatch or panic.
+    #[tokio::test]
+    async fn a_second_registry_entry_reports_the_right_index() {
+        let f = stranded_repo().await;
+        let decoy = *blake3::hash(&synthetic_wasm(0xDD)).as_bytes();
+        let registry: &[(&[u8; 32], &str)] = &[
+            (&decoy, "0.1.2 repo-contract"),
+            (&f.legacy_hash, "0.1.3 repo-contract"),
+        ];
+
+        let mut api = wsclient::connect(f.env.ws_url.as_str())
+            .await
+            .expect("connect");
+        let recovered = within(fetch_repo_state_from_registry(
+            &f.env,
+            &mut api,
+            &f.current_wasm,
+            registry,
+        ))
+        .await
+        .expect("second registry entry holds the state");
+
+        assert_eq!(recovered.to_bytes(), f.state_bytes);
+        let gets = f.gateway.gets();
+        assert_eq!(
+            gets.len(),
+            3,
+            "current key, decoy predecessor, then the real one: {gets:?}"
+        );
+        assert_eq!(gets[2], f.legacy_id);
+        assert_eq!(f.gateway.puts()[0].0, f.current_id);
+    }
 }
 
 #[cfg(test)]
