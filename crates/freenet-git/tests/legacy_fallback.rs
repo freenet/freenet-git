@@ -79,6 +79,12 @@ fn blake3_of(wasm: &[u8]) -> [u8; 32] {
 /// probe/recover sequencing.
 const PREDECESSOR_STATE: &[u8] = b"state-published-by-the-old-contract";
 
+/// How long the retry test waits for the first predecessor probe
+/// before giving up. Generous compared to the milliseconds a loopback
+/// probe actually takes; its job is only to bound the wait so a broken
+/// fallback fails the test instead of hanging it.
+const HEAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The core claim: when the current contract key has nothing and a
 /// registered predecessor key does, the fallback recovers the
 /// predecessor's state and reports where it came from.
@@ -297,17 +303,20 @@ async fn transient_predecessor_timeout_is_retried_and_then_recovers() {
     // attempt 2 (after the 2s backoff) finds state. Polling on the
     // observed-request log rather than a fixed sleep keeps this
     // deterministic regardless of machine speed.
-    let healer = {
-        let url = gateway.url().to_string();
-        let _ = url;
-        async {
-            loop {
-                if gateway.gets().contains(&legacy_id) {
-                    gateway.set_reply(legacy_id, Reply::State(PREDECESSOR_STATE.to_vec()));
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    //
+    // The deadline matters: if the predecessor is never probed at all
+    // (the shape of a broken fallback) this loop would otherwise spin
+    // forever and `tokio::join!` below would hang instead of failing.
+    // A test that hangs on a regression is barely better than one that
+    // passes — CI reports a timeout, not a diagnosis.
+    let healer = async {
+        let deadline = tokio::time::Instant::now() + HEAL_DEADLINE;
+        while tokio::time::Instant::now() < deadline {
+            if gateway.gets().contains(&legacy_id) {
+                gateway.set_reply(legacy_id, Reply::State(PREDECESSOR_STATE.to_vec()));
+                return;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     };
 
