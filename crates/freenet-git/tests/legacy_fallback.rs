@@ -345,6 +345,55 @@ async fn transient_predecessor_timeout_is_retried_and_then_recovers() {
     );
 }
 
+/// Production must hand the *real* registry to the seam.
+///
+/// Everything downstream of that argument is covered by the tests
+/// above, because they inject their own registry. The one line those
+/// tests cannot observe is the wrapper's: while
+/// `legacy_contracts.toml` is empty, passing `&[]`, or the wrong
+/// constant, or dropping the argument's meaning entirely produces
+/// behaviour identical to passing the real thing. A regression there
+/// would surface only at the first genuine re-key — the exact scenario
+/// this file exists to de-risk.
+///
+/// So it is pinned by scraping the source. A source pin is a blunt
+/// instrument, but it is the right shape here: the property is "this
+/// call site names this constant", which is a fact about the text.
+///
+/// Three anti-vacuity guards, because a source pin that stops matching
+/// anything passes silently:
+///   * the wrapper must be found at all, else fail loudly;
+///   * the needle is compared whitespace-stripped, so `cargo fmt`
+///     rewrapping the call cannot disarm it;
+///   * this test lives in an integration file and scrapes a *different*
+///     file, so it can neither match its own text nor be switched off
+///     by deleting a `#[cfg(test)] mod tests` block.
+#[test]
+fn production_fetch_repo_state_passes_the_generated_registry() {
+    const BIN_SRC: &str = include_str!("../src/bin/git-remote-freenet.rs");
+
+    let start = BIN_SRC
+        .find("async fn fetch_repo_state(")
+        .expect("fn fetch_repo_state was renamed or removed; this pin is now testing nothing");
+    let body = &BIN_SRC[start..];
+    let end = body
+        .find("\n}\n")
+        .expect("could not find the end of fetch_repo_state");
+    let wrapper: String = body[..end].chars().filter(|c| !c.is_whitespace()).collect();
+
+    assert!(
+        wrapper.contains("freenet_git_cli::legacy::LEGACY_REPO_CONTRACT_WASM_HASHES"),
+        "fetch_repo_state must pass the generated registry to \
+         fetch_repo_state_from_registry. Passing anything else is invisible to \
+         every other test while legacy_contracts.toml is empty, and would only \
+         be discovered at the first real re-key. Wrapper body was:\n{wrapper}"
+    );
+    assert!(
+        !wrapper.contains("&[]"),
+        "fetch_repo_state must not pass an empty registry:\n{wrapper}"
+    );
+}
+
 /// Negative control. If nothing exists anywhere, the fallback must fail
 /// — and say so in terms that distinguish absence from a sick gateway.
 ///
