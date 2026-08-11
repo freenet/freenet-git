@@ -279,33 +279,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ciborium"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42e69ffd6f0917f5c029256a24d0161db17cea3997d185db0d35926308770f0e"
-dependencies = [
- "ciborium-io",
- "ciborium-ll",
- "serde",
-]
-
-[[package]]
-name = "ciborium-io"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05afea1e0a06c9be33d539b876f1ce3692f4afea2cb41f740e7743225ed1c757"
-
-[[package]]
-name = "ciborium-ll"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
-dependencies = [
- "ciborium-io",
- "half",
-]
-
-[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -403,12 +376,6 @@ checksum = "8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201"
 dependencies = [
  "libc",
 ]
-
-[[package]]
-name = "crunchy"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crypto-common"
@@ -664,10 +631,8 @@ dependencies = [
  "freenet-git-encoding",
  "freenet-git-identity",
  "freenet-git-types",
- "freenet-migrate",
  "freenet-migrate-build",
- "freenet-stdlib 0.6.1",
- "freenet-stdlib 0.8.5",
+ "freenet-stdlib",
  "futures",
  "hex",
  "libc",
@@ -719,7 +684,7 @@ name = "freenet-git-pack-contract"
 version = "0.1.27"
 dependencies = [
  "blake3",
- "freenet-stdlib 0.6.1",
+ "freenet-stdlib",
 ]
 
 [[package]]
@@ -729,7 +694,7 @@ dependencies = [
  "bincode",
  "ed25519-dalek",
  "freenet-git-types",
- "freenet-stdlib 0.6.1",
+ "freenet-stdlib",
 ]
 
 [[package]]
@@ -759,22 +724,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "freenet-migrate"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "866b434a07257c5bcda3b4e2a64c2c51e584ac7bc8664b91c0429352fb23e4fb"
-dependencies = [
- "blake3",
- "bs58",
- "ciborium",
- "ed25519-dalek",
- "freenet-scaffold",
- "freenet-stdlib 0.8.5",
- "serde",
- "serde_with",
-]
-
-[[package]]
 name = "freenet-migrate-build"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -784,26 +733,6 @@ dependencies = [
  "bs58",
  "serde",
  "toml",
-]
-
-[[package]]
-name = "freenet-scaffold"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff8840a95aa4b4499cf8532d9c74814339647d39c4b537a55b540445a439b56f"
-dependencies = [
- "freenet-scaffold-macro",
- "serde",
-]
-
-[[package]]
-name = "freenet-scaffold-macro"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99c6d26e7ce019d8eba883b307ee55dd1d10c85ccc9bec72b069bdf07c50a87d"
-dependencies = [
- "quote",
- "syn",
 ]
 
 [[package]]
@@ -834,30 +763,6 @@ dependencies = [
  "tracing-subscriber",
  "wasm-bindgen",
  "web-sys",
-]
-
-[[package]]
-name = "freenet-stdlib"
-version = "0.8.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b62aeba7634d1ae5c2d02f78db33ee40442511858275be5be2099d24a13b2559"
-dependencies = [
- "bincode",
- "blake3",
- "bs58",
- "byteorder",
- "bytes",
- "chrono",
- "flatbuffers",
- "freenet-macros",
- "futures",
- "semver",
- "serde",
- "serde_json",
- "serde_with",
- "thiserror",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -992,17 +897,6 @@ dependencies = [
  "r-efi 6.0.0",
  "wasip2",
  "wasip3",
-]
-
-[[package]]
-name = "half"
-version = "2.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
-dependencies = [
- "cfg-if",
- "crunchy",
- "zerocopy",
 ]
 
 [[package]]

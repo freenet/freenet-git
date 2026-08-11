@@ -335,7 +335,7 @@ async fn fetch_repo_state_from_registry(
     env: &HelperEnv,
     api: &mut freenet_stdlib::client_api::WebApi,
     repo_wasm: &[u8],
-    registry: &[freenet_migrate::ContractLineageEntry],
+    registry: &[freenet_git_cli::legacy::ContractLineageEntry],
 ) -> Result<RepoState> {
     use freenet_git_cli::wsclient::{GetSource, LegacyAwareGet};
 
@@ -1493,7 +1493,7 @@ mod migration_tests {
 
     use super::fake_gateway::{FakeGateway, Reply};
     use super::*;
-    use freenet_migrate::ContractLineageEntry;
+    use freenet_git_cli::legacy::ContractLineageEntry;
     use freenet_stdlib::prelude::{ContractCode, Parameters};
     use std::collections::HashMap;
 

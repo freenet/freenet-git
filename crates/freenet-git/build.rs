@@ -12,6 +12,13 @@
 fn main() {
     freenet_migrate_build::codegen()
         .registry("legacy_contracts.toml")
+        // The emitted consts name their entry types through this path:
+        // `crate::legacy::{Contract,Delegate}LineageEntry`, defined in
+        // src/lib.rs. The freenet-migrate RUNTIME crate (whose types the
+        // codegen references by default) cannot be linked here — see the
+        // workspace Cargo.toml on the stdlib 0.6/0.8 `__frnt_set_id`
+        // duplicate-symbol conflict.
+        .crate_path("crate::legacy")
         .out_file("legacy_contracts.rs")
         .emit()
         .expect("parse legacy_contracts.toml and generate lineage consts");

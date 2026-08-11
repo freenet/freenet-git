@@ -10,10 +10,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::legacy::ContractLineageEntry;
 use anyhow::{anyhow, bail, Context, Result};
-use freenet_migrate::{
-    contract_probe, ContractLineageEntry, Outcome, ProbeStateOps, SelectionPolicy, Step,
-};
 use freenet_stdlib::client_api::{
     ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,
 };
@@ -187,30 +185,26 @@ pub fn instance_id(key: &ContractKey) -> ContractInstanceId {
     *key.id()
 }
 
-/// Convert an instance id from freenet-migrate's stdlib version (0.8) into
-/// this client's (0.6). The two are nominally distinct Rust types wrapping the
-/// same 32 bytes; nothing about the value changes. Confining the conversion to
-/// this one function (plus the derivation-equivalence test below) keeps the
-/// dual-stdlib boundary from spreading through the client.
-fn to_client_id(id: freenet_stdlib_migrate::prelude::ContractInstanceId) -> ContractInstanceId {
-    let mut spec = [0u8; 32];
-    spec.copy_from_slice(id.as_bytes());
-    ContractInstanceId::new(spec)
-}
-
 /// Compute a contract instance id from a registered predecessor generation
 /// and parameters bytes, without needing the old WASM (we ship only its
-/// BLAKE3, in `legacy_contracts.toml`). The derivation
-/// (`BLAKE3(BLAKE3(code) || params)`) is `freenet-migrate`'s
-/// `contract_id_from_code_hash` — the same function every adopter of the
-/// shared migration machinery probes with — converted to this client's
-/// stdlib types at the boundary.
+/// BLAKE3, in `legacy_contracts.toml`).
+///
+/// This duplicates the derivation `freenet_stdlib` does internally
+/// (`BLAKE3(BLAKE3(code) || params)`) but skips the `BLAKE3(code)` step
+/// since the registry already stores it. It is byte-identical to
+/// `freenet_migrate::contract_id_from_code_hash` (the shared migration
+/// crate's derivation); that crate cannot be linked here while this
+/// workspace is on stdlib 0.6 (see the workspace Cargo.toml), so the
+/// eight lines are inlined and pinned against the stdlib's own
+/// derivation by `legacy_id_derivation_matches_full_derivation`.
 pub fn legacy_instance_id(entry: &ContractLineageEntry, params_bytes: &[u8]) -> ContractInstanceId {
-    let params = freenet_stdlib_migrate::prelude::Parameters::from(params_bytes.to_vec());
-    to_client_id(freenet_migrate::contract_id_from_code_hash(
-        &entry.code_hash,
-        &params,
-    ))
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&entry.code_hash);
+    hasher.update(params_bytes);
+    let full = hasher.finalize();
+    let mut spec = [0u8; 32];
+    spec.copy_from_slice(full.as_bytes());
+    ContractInstanceId::new(spec)
 }
 
 /// Prefix used in `get_state`'s timeout `bail!` messages. Shared
@@ -427,21 +421,28 @@ const MAX_BACKOFF_SECS: u64 = 60;
 /// of whether it came from a legacy key (so the caller can re-PUT it to
 /// the current key for migration).
 ///
-/// The probe sequencing over the legacy generations is `freenet-migrate`'s
-/// backward-probe driver (the same decisions River's shipped UI probe
-/// makes): candidates are ordered by the registry's `generation` field
-/// descending, and the first real (non-empty) state wins. Newest-first is
-/// load-bearing — if two retired generations both still hold state, the
-/// older one can never shadow the newer, so a migration cannot roll a repo
-/// back. One crate default is deliberately overridden: the driver's
-/// recommended "timeout = miss, advance to the next candidate" semantics
-/// would let an OLDER generation's state be adopted while a NEWER one was
-/// merely unreachable — concluding absence from silence. Instead, any
-/// probe outcome that is not authoritative (per-op timeout, gateway
-/// backpressure, transport error) aborts the whole pass, and the pass is
-/// retried; only an authoritative NotFound/empty advances the walk
-/// (freenet-migrate#19: present / genuinely absent / unknown must stay a
-/// three-way distinction, and unknown means retry, never conclude).
+/// The probe decisions over the legacy generations match the shared
+/// `freenet-migrate` backward-probe driver (the decisions River's shipped
+/// UI probe makes), with one deliberate deviation. Matching: candidates
+/// are ordered by the registry's `generation` field descending, and the
+/// first real (non-empty) state wins. Newest-first is load-bearing — if
+/// two retired generations both still hold state, the older one can never
+/// shadow the newer, so a migration cannot roll a repo back. Deviating:
+/// the driver's recommended "timeout = miss, advance to the next
+/// candidate" semantics would let an OLDER generation's state be adopted
+/// while a NEWER one was merely unreachable — concluding absence from
+/// silence. Instead, any probe outcome that is not authoritative (per-op
+/// timeout, gateway backpressure, transport error) aborts the whole pass,
+/// and the pass is retried; only an authoritative NotFound/empty advances
+/// the walk (freenet-migrate#19: present / genuinely absent / unknown
+/// must stay a three-way distinction, and unknown means retry, never
+/// conclude).
+///
+/// (The walk is hand-rolled rather than pumped through the crate's
+/// `ProbeDriver` because the runtime crate cannot link against this
+/// workspace's stdlib 0.6 — see the workspace Cargo.toml. The registry
+/// shape, validation, and re-key guard ARE the shared crate's, via
+/// `freenet-migrate-build`.)
 ///
 /// `timeout` is per-probe, not total — a long list of legacy generations
 /// can take O(N × timeout) in the worst case.
@@ -513,49 +514,22 @@ pub async fn get_state_with_legacy_fallback(
 /// within the same job.
 const PROBE_MAX_ATTEMPTS: u32 = 4;
 
-/// App-side state semantics for the legacy backward probe: the fallback is
-/// agnostic to the state's content (the caller decodes via
-/// `RepoState::from_bytes`), so a candidate "hit" is exactly a non-empty
-/// byte string — the same criterion the hand-rolled walk used.
-///
-/// `merge_with_local` keeps the recovered bytes untouched: a git remote
-/// helper is stateless (there is no device-local snapshot to fold in), and
-/// the forward PUT relies on the repo contract's own on-network
-/// `validate_state`/merge, exactly as before. `RepoState` is not a
-/// `freenet-scaffold` `ComposableState`, so the crate's local
-/// `CarryForward` fold does not apply here.
-struct RawStateOps;
-
-impl ProbeStateOps for RawStateOps {
-    type State = Vec<u8>;
-
-    fn decode(&self, bytes: &[u8]) -> Option<Vec<u8>> {
-        Some(bytes.to_vec())
-    }
-
-    fn is_real(&self, state: &Vec<u8>) -> bool {
-        !state.is_empty()
-    }
-
-    fn merge_with_local(&self, recovered: Vec<u8>, _local: &Vec<u8>) -> Vec<u8> {
-        recovered
-    }
-}
-
 /// Run one full probe pass: try the current key, then walk the legacy
-/// generations newest-first via `freenet-migrate`'s probe driver.
-/// `Ok` on the first non-empty hit; `Err(outcomes)` with the per-probe
-/// outcome list when the pass fails (so the caller can decide whether
-/// the failure is transient and worth retrying).
+/// generations newest-first (highest `generation` first). `Ok` on the
+/// first non-empty hit; `Err(outcomes)` with the per-probe outcome list
+/// when the pass fails (so the caller can decide whether the failure is
+/// transient and worth retrying).
 ///
-/// The driver owns the candidate order, the hit criterion, and when the
-/// walk advances; this pump owns the I/O and the absent-vs-unknown
-/// classification. Only an authoritative per-key answer (`NotFound` or an
-/// empty response) advances the walk — it is delivered to the driver as a
-/// miss. Anything non-authoritative (timeout, backpressure, transport
-/// error) aborts the pass instead, so silence is never treated as
-/// absence and an older generation is never adopted past an unreachable
-/// newer one (the freenet-migrate#19 override; see
+/// A candidate "hit" is exactly a non-empty byte string: the fallback is
+/// agnostic to the state's content (the caller decodes via
+/// `RepoState::from_bytes`), and the forward PUT relies on the repo
+/// contract's own on-network `validate_state`/merge.
+///
+/// Only an authoritative per-key answer (`NotFound` or an empty
+/// response) advances the walk. Anything non-authoritative (timeout,
+/// backpressure, transport error) aborts the pass instead, so silence is
+/// never treated as absence and an older generation is never adopted
+/// past an unreachable newer one (the freenet-migrate#19 override; see
 /// [`get_state_with_legacy_fallback`]).
 async fn probe_all_keys(
     web_api: &mut WebApi,
@@ -595,79 +569,56 @@ async fn probe_all_keys(
         }
     }
 
-    // Legacy generations, sequenced by the shared probe driver
-    // (newest generation first, first real state wins).
-    //
-    // `(slice index, client-side id, driver-side id)` per entry, derived
-    // once: the driver speaks freenet-migrate's stdlib types, the wire
-    // client this crate's, and the slice index is what `GetSource::Legacy`
-    // reports back to the caller (which indexes the same `lineage` slice
-    // for its log line).
-    let candidates: Vec<(usize, ContractInstanceId)> = lineage
+    // Legacy generations, newest first. `(slice index, derived id)` per
+    // entry, ordered by `generation` DESCENDING — the registry's declared
+    // ordering field, not its slice order, so a registry authored out of
+    // order still probes newest-first (generations are unique, validated
+    // at build time). The slice index is what `GetSource::Legacy` reports
+    // back to the caller (which indexes the same `lineage` slice for its
+    // log line).
+    let mut candidates: Vec<(usize, ContractInstanceId)> = lineage
         .iter()
         .enumerate()
         .map(|(idx, entry)| (idx, legacy_instance_id(entry, params_bytes)))
         .collect();
-    let lookup = |driver_id: freenet_stdlib_migrate::prelude::ContractInstanceId| {
-        candidates
-            .iter()
-            .find(|(_, client_id)| client_id.as_bytes() == driver_id.as_bytes())
-            .copied()
-            .expect("driver candidates are derived from the same lineage")
-    };
+    candidates.sort_by_key(|&(idx, _)| core::cmp::Reverse(lineage[idx].generation));
 
-    let params = freenet_stdlib_migrate::prelude::Parameters::from(params_bytes.to_vec());
-    let mut driver = contract_probe(
-        RawStateOps,
-        Vec::new(),
-        &params,
-        lineage,
-        SelectionPolicy::NewestFirstWins,
-    );
-    while let Step::Get(driver_id) = driver.next_action() {
-        let (idx, legacy_id) = lookup(driver_id);
+    for (idx, legacy_id) in candidates {
         let label = format!("legacy key {idx} ({legacy_id})");
         match get_state(web_api, legacy_id, false, timeout).await {
-            Ok(state) => {
-                if state.is_empty() {
-                    outcomes.push((label, ProbeOutcome::Empty));
-                }
-                // Non-empty is a hit (`is_real`); empty is a miss
-                // the driver advances past.
-                driver.on_response(driver_id, &state);
+            // First real (non-empty) state wins: newer generations were
+            // already probed, so nothing older can shadow this hit.
+            Ok(state) if !state.is_empty() => {
+                return Ok(LegacyAwareGet {
+                    state,
+                    source: GetSource::Legacy {
+                        index: idx,
+                        instance: legacy_id,
+                    },
+                });
             }
+            // An empty response is an authoritative per-key miss: the
+            // walk advances to the next-older generation.
+            Ok(_) => outcomes.push((label, ProbeOutcome::Empty)),
             Err(e) => {
                 let outcome = ProbeOutcome::from_get_state_err(&e);
                 tracing::debug!("legacy probe {idx} failed: {e}");
                 let authoritative =
                     matches!(outcome.retry_disposition(), RetryDisposition::Authoritative);
                 outcomes.push((label, outcome));
-                if authoritative {
-                    // NotFound is authoritative for THIS key only:
-                    // deliver it as a per-candidate miss so the
-                    // walk advances to the next-older generation.
-                    driver.on_timeout(driver_id);
-                } else {
-                    // Unknown → abort the pass; never conclude
-                    // absence (or adopt an older generation) from
-                    // silence.
+                if !authoritative {
+                    // Unknown → abort the pass; never conclude absence
+                    // (or adopt an older generation) from silence.
                     return Err(outcomes);
                 }
+                // NotFound is authoritative for THIS key only: advance
+                // to the next-older generation.
             }
         }
     }
-    match driver.take_outcome() {
-        Some(Outcome::Recovered { merged, source, .. }) => {
-            let (index, instance) = lookup(source);
-            Ok(LegacyAwareGet {
-                state: merged,
-                source: GetSource::Legacy { index, instance },
-            })
-        }
-        // Every candidate authoritatively missed (or there were none):
-        // the recorded outcomes say why.
-        Some(Outcome::SeedLocal { .. }) | Some(Outcome::NoLegacy { .. }) | None => Err(outcomes),
-    }
+    // Every candidate authoritatively missed (or there were none): the
+    // recorded outcomes say why.
+    Err(outcomes)
 }
 
 /// Build the final error returned when every probe in
@@ -1250,16 +1201,12 @@ mod tests {
     use super::*;
     use freenet_stdlib::prelude::{ContractCode, Parameters};
 
-    /// [`legacy_instance_id`] must produce exactly the same id as this
-    /// client's stdlib (`ContractInstanceId::from_params_and_code`) would,
-    /// given the matching WASM bytes whose BLAKE3 the registry stores.
-    ///
-    /// This is the dual-stdlib boundary pin: the derivation runs in
-    /// `freenet-migrate` over stdlib-0.8 types and is converted to this
-    /// client's stdlib-0.6 id via [`to_client_id`]. The oracle side is
-    /// derived entirely with the 0.6 stdlib this client sends GETs with,
-    /// so a drift in the crate's derivation OR a byte-order bug in the
-    /// conversion probes a key that never existed — and fails here.
+    /// [`legacy_instance_id`] must produce exactly the same id as the
+    /// stdlib (`ContractInstanceId::from_params_and_code`) would, given
+    /// the matching WASM bytes whose BLAKE3 the registry stores. The
+    /// oracle side is the stdlib's own derivation over the full WASM, so
+    /// a drift in the shortcut (hash order, truncation) probes a key
+    /// that never existed — and fails here.
     #[test]
     fn legacy_id_derivation_matches_full_derivation() {
         let fake_wasm: Vec<u8> = (0..1024u32).map(|i| (i & 0xFF) as u8).collect();

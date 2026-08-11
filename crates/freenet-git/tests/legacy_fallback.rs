@@ -6,8 +6,10 @@
 //! under the old key. `legacy_contracts.toml` plus
 //! [`wsclient::get_state_with_legacy_fallback`] is this crate's remedy:
 //! record the predecessor WASM hashes, and on a miss at the current key
-//! walk backwards through them — sequenced by `freenet-migrate`'s
-//! backward-probe driver, newest generation first.
+//! walk backwards through them, newest generation first (matching the
+//! shared `freenet-migrate` probe driver's decisions; see wsclient for
+//! why the walk itself is local while the registry machinery is the
+//! shared crate's).
 //!
 //! That registry has been empty since it was introduced (2026-04-30),
 //! legitimately so — the committed contract WASM has not changed since,
@@ -20,16 +22,14 @@
 //!
 //! Every legacy instance id these tests expect is derived with the
 //! *stdlib's* `ContractInstanceId::from_params_and_code` over synthetic
-//! predecessor WASM bytes — the same stdlib version the client GETs
-//! with. The code under test derives the same id via
-//! `freenet-migrate`'s `contract_id_from_code_hash` (over its own,
-//! newer stdlib's types) and converts it at the boundary. Deriving the
-//! expectation from the code under test would make the tests
-//! self-consistent rather than correct: they would keep passing if the
-//! crate's derivation or the cross-stdlib conversion drifted from the
-//! real key derivation and every migration probed a key that never
-//! existed. The gateway stores state under the stdlib-derived id, so a
-//! drift probes an id the gateway does not know and the test fails.
+//! predecessor WASM bytes. The code under test derives the same id via
+//! `wsclient::legacy_instance_id`, which shortcuts the `BLAKE3(code)`
+//! step. Deriving the expectation with the shortcut would make the
+//! tests self-consistent rather than correct: they would keep passing
+//! if the shortcut drifted from the real key derivation and every
+//! migration probed a key that never existed. The gateway stores state
+//! under the stdlib-derived id, so a drifted shortcut probes an id the
+//! gateway does not know and the test fails.
 
 #[path = "support/fake_gateway.rs"]
 mod fake_gateway;
@@ -37,8 +37,8 @@ mod fake_gateway;
 use std::collections::HashMap;
 
 use fake_gateway::{FakeGateway, Reply, FAST_PROBE_TIMEOUT};
+use freenet_git_cli::legacy::ContractLineageEntry;
 use freenet_git_cli::wsclient::{self, GetSource};
-use freenet_migrate::ContractLineageEntry;
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, Parameters};
 
 /// Synthetic stand-in for the repo-contract WASM of some freenet-git

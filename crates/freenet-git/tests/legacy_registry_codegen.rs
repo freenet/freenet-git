@@ -17,7 +17,7 @@
 //! only on the first real re-key, which is exactly when users' repos
 //! depend on it.
 
-use freenet_migrate::ContractLineageEntry;
+use freenet_git_cli::legacy::ContractLineageEntry;
 use freenet_migrate_build::{codegen, BuildError, Registry};
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, Parameters};
 use std::io::Write as _;
@@ -39,7 +39,12 @@ fn hex_of(bytes: &[u8; 32]) -> String {
 fn generate(toml: &str) -> Result<String, BuildError> {
     let mut file = tempfile::NamedTempFile::new().expect("tempfile");
     file.write_all(toml.as_bytes()).expect("write registry");
-    codegen().registry(file.path()).generate_string()
+    codegen()
+        .registry(file.path())
+        // Match build.rs: consts name their entry types through the
+        // crate-local `legacy` module, not the (unlinkable) runtime crate.
+        .crate_path("crate::legacy")
+        .generate_string()
 }
 
 /// Pull each emitted entry's `(generation, code_hash)` back out of the
@@ -54,11 +59,11 @@ fn extract_generated_entries(generated: &str) -> Vec<(u32, [u8; 32])> {
     let mut out = Vec::new();
     for line in generated.lines() {
         // Entry lines look like
-        // `    ::freenet_migrate::ContractLineageEntry { generation: 1u32,
+        // `    crate::legacy::ContractLineageEntry { generation: 1u32,
         //  code_hash: [12, 34, …], note: "…" },`.
         let Some(rest) = line
             .trim_start()
-            .strip_prefix("::freenet_migrate::ContractLineageEntry { generation: ")
+            .strip_prefix("crate::legacy::ContractLineageEntry { generation: ")
         else {
             continue;
         };
@@ -89,11 +94,9 @@ fn extract_generated_entries(generated: &str) -> Vec<(u32, [u8; 32])> {
 ///
 /// The final assertion is the one that matters. It compares against
 /// `ContractInstanceId::from_params_and_code` over the original WASM —
-/// the stdlib's own derivation, at the stdlib version this client GETs
-/// with — so a byte-order or truncation bug anywhere in TOML → parse →
-/// codegen → `wsclient::legacy_instance_id` (which crosses into
-/// freenet-migrate's newer stdlib and back) shows up as a key mismatch
-/// rather than as a self-consistent pass.
+/// the stdlib's own derivation — so a byte-order or truncation bug
+/// anywhere in TOML → parse → codegen → `wsclient::legacy_instance_id`
+/// shows up as a key mismatch rather than as a self-consistent pass.
 #[test]
 fn a_registry_entry_survives_the_trip_to_a_probeable_contract_key() {
     let legacy_wasm = synthetic_wasm(0x1E);
