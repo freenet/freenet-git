@@ -37,6 +37,8 @@ freenet-git-encoding = { workspace = true }
 freenet-git-types = { workspace = true, features = ["signing"] }
 freenet-git-identity = { workspace = true }
 freenet-stdlib = { workspace = true, features = ["net"] }
+freenet-migrate = { workspace = true }
+freenet-stdlib-migrate = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
@@ -61,7 +63,14 @@ hex = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[build-dependencies]
+freenet-migrate-build = { workspace = true }
+
 [dev-dependencies]
+# The registry/guard tests exercise the same build-side machinery build.rs
+# runs (parse + validate + hash-guard), so registry mistakes fail a test run
+# as well as the build.
+freenet-migrate-build = { workspace = true }
 tempfile = "3.10"
 assert_cmd = "2"
 predicates = "3"

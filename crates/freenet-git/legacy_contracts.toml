@@ -9,27 +9,41 @@
 #
 # Each entry below records the BLAKE3-32 of a previously-shipped
 # repo-contract WASM. On `git fetch` / `git clone`, when the current
-# contract key returns not-found, the helper iterates these legacy
-# hashes, computes the legacy contract key for the same prefix, and
-# tries each in turn. If state is found at a legacy key, the helper
-# GETs the state, validates it against the new contract semantics,
-# and PUTs it to the new contract key. State is signed by the repo
-# owner, so this migration is permissionless: any client with the
-# new WASM and access to the legacy state can do it.
+# contract key returns not-found, the helper walks these predecessor
+# generations newest-first, computes each generation's contract key for
+# the same prefix, and probes it. If state is found at a legacy key,
+# the helper GETs the state, validates it against the new contract
+# semantics, and PUTs it to the new contract key. State is signed by
+# the repo owner, so this migration is permissionless: any client with
+# the new WASM and access to the legacy state can do it.
+#
+# The file uses freenet-migrate's `[[contract]]` registry schema and is
+# parsed AT BUILD TIME by `freenet-migrate-build` (see build.rs): a
+# typo'd hash, a duplicate generation, or a malformed entry is a build
+# failure, never a silent runtime probe miss.
 #
 # How to add an entry when shipping a new freenet-git version that
 # changes the repo-contract WASM:
 #
 #   1. BEFORE bumping anything, capture the BLAKE3 of the
-#      currently-committed `crates/freenet-git/contracts/repo-contract.wasm`.
-#   2. Add an entry below with that hash and a one-line description
-#      ("0.1.3 repo-contract").
-#   3. Make your code changes, rebuild, copy the new WASM into the
+#      currently-committed `crates/freenet-git/contracts/repo-contract.wasm`
+#      (`b3sum` output — hex — and stdlib's base58 form are both accepted).
+#   2. Add a `[[contract]]` entry below:
+#
+#        [[contract]]
+#        generation = 1                # strictly increasing; older = smaller
+#        code_hash  = "<hex or base58 BLAKE3 of the retired WASM>"
+#        note       = "0.1.27 repo-contract (why it was retired)"
+#
+#   3. Update `PINNED_CURRENT_WASM_HASH_B58` in
+#      `tests/migration_guard.rs` to the NEW WASM's hash — the guard
+#      test fails with instructions until both edits are made.
+#   4. Make your code changes, rebuild, copy the new WASM into the
 #      contracts/ directory, ship.
 #
-# This file is parsed at compile time by the package's build.rs and
-# baked into the binary, so a `cargo install freenet-git` of any
-# version automatically knows how to read all prior versions' repos.
+# Probing is newest-first (highest `generation` first), so if several
+# generations still hold state, the most recent one wins and older
+# state can never shadow it.
 
 # (No legacy entries yet — 0.1.0..=0.1.3 was the rapid pre-1.0 churn
 # phase, where I (sanity) was the only person publishing repos and

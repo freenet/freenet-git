@@ -6,33 +6,30 @@
 //! under the old key. `legacy_contracts.toml` plus
 //! [`wsclient::get_state_with_legacy_fallback`] is this crate's remedy:
 //! record the predecessor WASM hashes, and on a miss at the current key
-//! walk backwards through them.
+//! walk backwards through them — sequenced by `freenet-migrate`'s
+//! backward-probe driver, newest generation first.
 //!
 //! That registry has been empty since it was introduced (2026-04-30),
 //! legitimately so — the committed contract WASM has not changed since,
 //! so no re-key has happened. The consequence is that the fallback's
-//! *sequencing* has never executed with a non-empty legacy list, in
-//! production or in CI. The existing unit tests all cover pieces in
-//! isolation (`dispatch_get_response`, `ProbeOutcome`,
-//! `outcomes_worth_retrying`, `format_fallback_failure`,
-//! `contract_id_from_wasm_hash`); none of them makes the code walk a
-//! predecessor key and hand back what it found.
-//!
-//! These tests close that gap by driving the real client against a fake
-//! gateway over a real loopback WebSocket (see `support/fake_gateway`).
+//! *sequencing* has never executed with a non-empty legacy list in
+//! production. These tests drive the real client against a fake gateway
+//! over a real loopback WebSocket (see `support/fake_gateway`).
 //!
 //! ## Oracle independence
 //!
 //! Every legacy instance id these tests expect is derived with the
 //! *stdlib's* `ContractInstanceId::from_params_and_code` over synthetic
-//! predecessor WASM bytes. The code under test derives the same id via
-//! `wsclient::contract_id_from_wasm_hash`, which shortcuts the
-//! `BLAKE3(code)` step. Deriving the expectation with the shortcut
-//! would make the test self-consistent rather than correct: it would
-//! keep passing if the shortcut drifted from the real key derivation
-//! and every migration probed the wrong key. The gateway stores state
-//! under the stdlib-derived id, so a drifted shortcut probes an id the
-//! gateway does not know and the test fails.
+//! predecessor WASM bytes — the same stdlib version the client GETs
+//! with. The code under test derives the same id via
+//! `freenet-migrate`'s `contract_id_from_code_hash` (over its own,
+//! newer stdlib's types) and converts it at the boundary. Deriving the
+//! expectation from the code under test would make the tests
+//! self-consistent rather than correct: they would keep passing if the
+//! crate's derivation or the cross-stdlib conversion drifted from the
+//! real key derivation and every migration probed a key that never
+//! existed. The gateway stores state under the stdlib-derived id, so a
+//! drift probes an id the gateway does not know and the test fails.
 
 #[path = "support/fake_gateway.rs"]
 mod fake_gateway;
@@ -41,6 +38,7 @@ use std::collections::HashMap;
 
 use fake_gateway::{FakeGateway, Reply, FAST_PROBE_TIMEOUT};
 use freenet_git_cli::wsclient::{self, GetSource};
+use freenet_migrate::ContractLineageEntry;
 use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, Parameters};
 
 /// Synthetic stand-in for the repo-contract WASM of some freenet-git
@@ -54,7 +52,7 @@ fn synthetic_wasm(tag: u8) -> Vec<u8> {
 
 /// Derive a contract instance id the way `freenet-stdlib` does, from
 /// full WASM bytes. This is the tests' oracle; see the module docs on
-/// why it must not be `wsclient::contract_id_from_wasm_hash`.
+/// why it must not be the crate-side derivation.
 fn stdlib_id(wasm: &[u8], params_bytes: &[u8]) -> ContractInstanceId {
     ContractInstanceId::from_params_and_code(
         Parameters::from(params_bytes.to_vec()),
@@ -69,8 +67,14 @@ fn params_for(prefix: &str) -> Vec<u8> {
     .to_bytes()
 }
 
-fn blake3_of(wasm: &[u8]) -> [u8; 32] {
-    *blake3::hash(wasm).as_bytes()
+/// A registry row for a synthetic predecessor WASM, as the build-time
+/// codegen would emit it from `legacy_contracts.toml`.
+fn entry(generation: u32, wasm: &[u8], note: &'static str) -> ContractLineageEntry {
+    ContractLineageEntry {
+        generation,
+        code_hash: *blake3::hash(wasm).as_bytes(),
+        note,
+    }
 }
 
 /// State bytes standing in for a serialized `RepoState`. The fallback
@@ -108,12 +112,12 @@ async fn recovers_state_from_a_predecessor_contract_key() {
     let gateway = FakeGateway::start(replies).await;
 
     let mut api = wsclient::connect(gateway.url()).await.expect("connect");
-    let legacy_hash = blake3_of(&legacy_wasm);
+    let lineage = [entry(1, &legacy_wasm, "0.1.3 repo-contract")];
     let found = wsclient::get_state_with_legacy_fallback(
         &mut api,
         current_id,
         &params,
-        &[&legacy_hash],
+        &lineage,
         FAST_PROBE_TIMEOUT,
     )
     .await
@@ -162,12 +166,12 @@ async fn current_key_wins_and_no_predecessor_is_probed() {
     let gateway = FakeGateway::start(replies).await;
 
     let mut api = wsclient::connect(gateway.url()).await.expect("connect");
-    let legacy_hash = blake3_of(&legacy_wasm);
+    let lineage = [entry(1, &legacy_wasm, "0.1.3 repo-contract")];
     let found = wsclient::get_state_with_legacy_fallback(
         &mut api,
         current_id,
         &params,
-        &[&legacy_hash],
+        &lineage,
         FAST_PROBE_TIMEOUT,
     )
     .await
@@ -185,13 +189,17 @@ async fn current_key_wins_and_no_predecessor_is_probed() {
     );
 }
 
-/// Predecessors are walked oldest-registered-first, in registry order,
-/// and the reported index identifies which one hit. The index is not
-/// cosmetic: `fetch_repo_state` uses it to index back into
-/// `LEGACY_REPO_CONTRACT_WASM_HASHES` for the log line, so an off-by-one
-/// would panic on a real migration.
+/// Predecessors are walked NEWEST GENERATION FIRST — the probe order is
+/// the registry's `generation` field descending, not the slice order the
+/// registry file happens to be written in (oldest-first by convention).
+/// Newest-first is the anti-rollback guarantee: when several retired
+/// generations still hold state, the most recent must win, or a
+/// migration would resurrect stale state and write it forward over the
+/// current key. The reported index is into the SLICE as passed (that is
+/// what `fetch_repo_state` prints the note from), so it must survive
+/// the reordering.
 #[tokio::test]
-async fn walks_predecessors_in_registry_order_and_reports_the_index() {
+async fn walks_predecessors_newest_generation_first() {
     let params = params_for("abc1234567");
     let current_id = stdlib_id(&synthetic_wasm(0xC0), &params);
 
@@ -199,49 +207,59 @@ async fn walks_predecessors_in_registry_order_and_reports_the_index() {
     let legacy_ids: Vec<ContractInstanceId> =
         legacy_wasms.iter().map(|w| stdlib_id(w, &params)).collect();
 
-    // Only the LAST registered predecessor holds state, so a fallback
-    // that stops early or probes in the wrong order fails.
+    // Registry slice order is oldest-first (generations 1, 2, 3), the
+    // convention the toml file documents. BOTH generation 1 (oldest) and
+    // generation 3 (newest) hold state: a fallback that probed in slice
+    // order, or stopped at the first slice entry, would adopt the OLDEST
+    // state and roll the repo back.
     let mut replies = HashMap::new();
+    replies.insert(legacy_ids[0], Reply::State(b"stale-oldest-state".to_vec()));
     replies.insert(legacy_ids[2], Reply::State(PREDECESSOR_STATE.to_vec()));
     let gateway = FakeGateway::start(replies).await;
 
     let mut api = wsclient::connect(gateway.url()).await.expect("connect");
-    let hashes: Vec<[u8; 32]> = legacy_wasms.iter().map(|w| blake3_of(w)).collect();
-    let hash_refs: Vec<&[u8; 32]> = hashes.iter().collect();
+    let lineage = [
+        entry(1, &legacy_wasms[0], "0.1.1 repo-contract"),
+        entry(2, &legacy_wasms[1], "0.1.2 repo-contract"),
+        entry(3, &legacy_wasms[2], "0.1.3 repo-contract"),
+    ];
 
     let found = wsclient::get_state_with_legacy_fallback(
         &mut api,
         current_id,
         &params,
-        &hash_refs,
+        &lineage,
         FAST_PROBE_TIMEOUT,
     )
     .await
-    .expect("third predecessor holds the state");
+    .expect("newest predecessor holds the state");
 
-    assert_eq!(found.state, PREDECESSOR_STATE);
+    assert_eq!(
+        found.state, PREDECESSOR_STATE,
+        "the NEWEST generation's state must win, not the older survivor's"
+    );
     match found.source {
         GetSource::Legacy { index, instance } => {
-            assert_eq!(index, 2, "the hit was registry entry 2");
+            assert_eq!(index, 2, "the hit was slice entry 2 (generation 3)");
             assert_eq!(instance, legacy_ids[2]);
         }
         GetSource::Current => panic!("state came from a predecessor, not the current key"),
     }
 
-    let mut expected = vec![current_id];
-    expected.extend(legacy_ids.iter().copied());
     assert_eq!(
         gateway.gets(),
-        expected,
-        "probe order must be current key, then predecessors in registry order"
+        vec![current_id, legacy_ids[2]],
+        "probe order must be current key, then the newest generation — which \
+         hit, so no older generation is probed at all"
     );
 }
 
 /// A predecessor that answers with zero-length state is a miss, not a
 /// recovery. `RepoState::from_bytes(&[])` would fail downstream, and
 /// worse, `fetch_repo_state` would re-PUT empty state over the current
-/// key. The `!state.is_empty()` guard in `probe_all_keys` is what
-/// prevents that; this pins it.
+/// key. The driver's is-real (non-empty) hit criterion is what prevents
+/// that; this pins it, and pins that the walk continues past the empty
+/// generation to an older one that has real state.
 #[tokio::test]
 async fn empty_state_at_a_predecessor_is_not_mistaken_for_recovery() {
     let params = params_for("abc1234567");
@@ -257,35 +275,49 @@ async fn empty_state_at_a_predecessor_is_not_mistaken_for_recovery() {
     let gateway = FakeGateway::start(replies).await;
 
     let mut api = wsclient::connect(gateway.url()).await.expect("connect");
-    let hashes = [blake3_of(&empty_wasm), blake3_of(&real_wasm)];
-    let hash_refs: Vec<&[u8; 32]> = hashes.iter().collect();
+    // The empty-answering generation is the NEWER one, so it is probed
+    // first and must be skipped.
+    let lineage = [
+        entry(1, &real_wasm, "0.1.2 repo-contract"),
+        entry(2, &empty_wasm, "0.1.3 repo-contract"),
+    ];
 
     let found = wsclient::get_state_with_legacy_fallback(
         &mut api,
         current_id,
         &params,
-        &hash_refs,
+        &lineage,
         FAST_PROBE_TIMEOUT,
     )
     .await
-    .expect("second predecessor holds real state");
+    .expect("older predecessor holds real state");
 
     assert_eq!(found.state, PREDECESSOR_STATE);
     match found.source {
         GetSource::Legacy { index, .. } => assert_eq!(
-            index, 1,
+            index, 0,
             "an empty response must be skipped, not returned as recovered state"
         ),
         GetSource::Current => panic!("state came from a predecessor"),
     }
+    assert_eq!(
+        gateway.gets(),
+        vec![current_id, empty_id, real_id],
+        "the empty generation must have been probed (and skipped) before the real one"
+    );
 }
 
 /// A predecessor probe that times out is transient, not authoritative:
 /// the whole sequence is retried, and the retry recovers the state.
 ///
-/// This is the one path where the current key being authoritatively
-/// absent must NOT suppress the retry — an all-authoritative outcome
-/// set fails fast. `outcomes_worth_retrying_retries_transient_legacy_after_current_not_found`
+/// This is the freenet-migrate#19 override made observable. The crate
+/// driver's recommended semantics treat a timeout as a per-candidate
+/// miss and advance — which, applied here, would conclude "no state
+/// found" (or adopt an older generation) from mere silence. Instead the
+/// pass aborts and re-runs: the current key being authoritatively
+/// absent must NOT suppress that retry — an all-authoritative outcome
+/// set fails fast, but this set has a transient member.
+/// `outcomes_worth_retrying_retries_transient_legacy_after_current_not_found`
 /// unit-tests that decision; this test proves the loop around it
 /// actually re-probes and recovers.
 #[tokio::test]
@@ -321,13 +353,12 @@ async fn transient_predecessor_timeout_is_retried_and_then_recovers() {
     };
 
     let mut api = wsclient::connect(gateway.url()).await.expect("connect");
-    let legacy_hash = blake3_of(&legacy_wasm);
-    let hash_refs = [&legacy_hash];
+    let lineage = [entry(1, &legacy_wasm, "0.1.3 repo-contract")];
     let probe = wsclient::get_state_with_legacy_fallback(
         &mut api,
         current_id,
         &params,
-        &hash_refs,
+        &lineage,
         FAST_PROBE_TIMEOUT,
     );
 
@@ -342,6 +373,131 @@ async fn transient_predecessor_timeout_is_retried_and_then_recovers() {
     assert!(
         gateway.gets().iter().filter(|id| **id == legacy_id).count() >= 2,
         "the predecessor must have been re-probed after the transient timeout"
+    );
+}
+
+/// The #19 override itself: while a NEWER generation is unreachable
+/// (silent), an OLDER generation's state must NOT be adopted — silence
+/// is "unknown", not "absent", and adopting past it would migrate stale
+/// state forward. The pass must abort and retry instead; once the newer
+/// generation heals, ITS state wins.
+#[tokio::test]
+async fn an_unreachable_newer_generation_is_never_skipped_for_an_older_one() {
+    let params = params_for("abc1234567");
+    let current_id = stdlib_id(&synthetic_wasm(0xC0), &params);
+    let newer_wasm = synthetic_wasm(0x91);
+    let older_wasm = synthetic_wasm(0x92);
+    let newer_id = stdlib_id(&newer_wasm, &params);
+    let older_id = stdlib_id(&older_wasm, &params);
+
+    let mut replies = HashMap::new();
+    replies.insert(newer_id, Reply::Silence);
+    replies.insert(older_id, Reply::State(b"stale-older-state".to_vec()));
+    let gateway = FakeGateway::start(replies).await;
+
+    let healer = async {
+        let deadline = tokio::time::Instant::now() + HEAL_DEADLINE;
+        while tokio::time::Instant::now() < deadline {
+            if gateway.gets().contains(&newer_id) {
+                gateway.set_reply(newer_id, Reply::State(PREDECESSOR_STATE.to_vec()));
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    };
+
+    let mut api = wsclient::connect(gateway.url()).await.expect("connect");
+    let lineage = [
+        entry(1, &older_wasm, "0.1.2 repo-contract"),
+        entry(2, &newer_wasm, "0.1.3 repo-contract"),
+    ];
+    let probe = wsclient::get_state_with_legacy_fallback(
+        &mut api,
+        current_id,
+        &params,
+        &lineage,
+        FAST_PROBE_TIMEOUT,
+    );
+
+    let (found, ()) = tokio::join!(probe, healer);
+    let found = found.expect("the healed newer generation should be recovered");
+
+    assert_eq!(
+        found.state, PREDECESSOR_STATE,
+        "the newer generation's state must win once reachable; adopting the \
+         older survivor while the newer was merely silent would migrate a \
+         rollback forward"
+    );
+    assert!(
+        matches!(found.source, GetSource::Legacy { index: 1, .. }),
+        "the hit must be attributed to the newer generation (slice entry 1)"
+    );
+    assert!(
+        !gateway.gets().contains(&older_id),
+        "the older generation must never have been probed: every pass ends at \
+         the unreachable newer generation until it heals"
+    );
+}
+
+/// A transient failure that never heals must exhaust the bounded retry
+/// budget ([`PROBE_MAX_ATTEMPTS`] passes) and then fail with a message
+/// that says TIMEOUT — never "no state found". Concluding absence from
+/// persistent silence is the data-loss shape freenet-migrate#19
+/// documents; the operator must be told the state of the network is
+/// unknown, and the operation must terminate rather than retry forever.
+///
+/// Deliberately real-time-heavy (~17s: 4 probe timeouts + 2s/4s/8s
+/// backoffs): the budget under test IS wall-clock behaviour, and the
+/// fake gateway holds real sockets that `tokio::time::pause` would
+/// deadlock. The outer 60s timeout turns "retries forever" (the shape
+/// of a removed attempt cap) into a fast, diagnosable failure instead
+/// of a CI hang.
+#[tokio::test]
+async fn persistent_transient_failure_exhausts_the_retry_budget() {
+    let params = params_for("abc1234567");
+    let current_id = stdlib_id(&synthetic_wasm(0xC0), &params);
+    let legacy_wasm = synthetic_wasm(0x5F);
+
+    // The CURRENT key never answers; the probe never even reaches the
+    // predecessor because silence at the current key makes every pass
+    // abort (unknown → retry, never conclude).
+    let mut replies = HashMap::new();
+    replies.insert(current_id, Reply::Silence);
+    let gateway = FakeGateway::start(replies).await;
+
+    let mut api = wsclient::connect(gateway.url()).await.expect("connect");
+    let lineage = [entry(1, &legacy_wasm, "0.1.3 repo-contract")];
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        wsclient::get_state_with_legacy_fallback(
+            &mut api,
+            current_id,
+            &params,
+            &lineage,
+            FAST_PROBE_TIMEOUT,
+        ),
+    )
+    .await
+    .expect("the retry budget is bounded: the fallback must terminate, not retry forever");
+
+    let msg = match result {
+        Ok(_) => panic!("nothing ever answered, yet the fallback returned state"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        msg.contains("timed out"),
+        "persistent timeouts must surface as timeouts (state unknown), got: {msg}"
+    );
+    assert!(
+        !msg.contains("no state found"),
+        "persistent timeouts must NOT be reported as absence — that message \
+         invites the operator to conclude data loss: {msg}"
+    );
+    assert_eq!(
+        gateway.gets(),
+        vec![current_id; 4],
+        "exactly PROBE_MAX_ATTEMPTS (4) passes, each aborting at the silent \
+         current key without touching the predecessor"
     );
 }
 
@@ -382,7 +538,7 @@ fn production_fetch_repo_state_passes_the_generated_registry() {
     let wrapper: String = body[..end].chars().filter(|c| !c.is_whitespace()).collect();
 
     assert!(
-        wrapper.contains("freenet_git_cli::legacy::LEGACY_REPO_CONTRACT_WASM_HASHES"),
+        wrapper.contains("freenet_git_cli::legacy::CONTRACT_LINEAGE"),
         "fetch_repo_state must pass the generated registry to \
          fetch_repo_state_from_registry. Passing anything else is invisible to \
          every other test while legacy_contracts.toml is empty, and would only \
@@ -408,7 +564,7 @@ async fn reports_absence_when_neither_current_nor_predecessor_has_state() {
     // Empty reply map: the gateway answers NotFound for everything.
     let gateway = FakeGateway::start(HashMap::new()).await;
     let mut api = wsclient::connect(gateway.url()).await.expect("connect");
-    let legacy_hash = blake3_of(&legacy_wasm);
+    let lineage = [entry(1, &legacy_wasm, "0.1.3 repo-contract")];
 
     // `LegacyAwareGet` has no `Debug`, so unwrap the error by hand
     // rather than reaching for `expect_err`.
@@ -416,7 +572,7 @@ async fn reports_absence_when_neither_current_nor_predecessor_has_state() {
         &mut api,
         current_id,
         &params,
-        &[&legacy_hash],
+        &lineage,
         FAST_PROBE_TIMEOUT,
     )
     .await

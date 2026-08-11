@@ -12,7 +12,9 @@ members = [
 [workspace.package]
 version = "0.1.27"
 edition = "2021"
-rust-version = "1.86"
+# 1.87 is freenet-migrate's MSRV (u64::is_multiple_of); the toolchain is
+# pinned well above it in rust-toolchain.toml.
+rust-version = "1.87"
 license = "LGPL-3.0-only"
 repository = "https://github.com/freenet/freenet-git"
 homepage = "https://freenet.org"
@@ -56,6 +58,19 @@ rpassword = "7"
 
 # Freenet
 freenet-stdlib = { version = "0.6.0" }
+
+# Shared upgrade-migration machinery (registry codegen + backward-probe
+# driver). The runtime crate is built against freenet-stdlib 0.8.x, which
+# coexists with the 0.6.0 the rest of this workspace (including the contract
+# crates) is pinned to; the CLI converts instance ids at the boundary (see
+# wsclient). The contract crates MUST stay on 0.6.0 — bumping their stdlib
+# re-keys every repo (see legacy_contracts.toml).
+freenet-migrate = { version = "0.5.0" }
+freenet-migrate-build = { version = "0.2.0" }
+# Named alias for the stdlib version freenet-migrate's API surface uses
+# (Parameters / ContractInstanceId in its signatures are 0.8 types, distinct
+# from this workspace's 0.6 types even though both are 32-byte wrappers).
+freenet-stdlib-migrate = { package = "freenet-stdlib", version = "0.8.2", default-features = false }
 
 # Internal — keep both `path` and `version`. Path is used during local
 # development (workspace builds); version is required for crates.io.

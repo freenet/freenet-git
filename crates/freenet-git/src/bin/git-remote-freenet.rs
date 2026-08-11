@@ -317,7 +317,7 @@ async fn fetch_repo_state(
         env,
         api,
         repo_wasm,
-        freenet_git_cli::legacy::LEGACY_REPO_CONTRACT_WASM_HASHES,
+        freenet_git_cli::legacy::CONTRACT_LINEAGE,
     )
     .await
 }
@@ -328,14 +328,14 @@ async fn fetch_repo_state(
 /// The const is empty in every shipped build and can only be filled by
 /// editing `legacy_contracts.toml` and rebuilding, so tests cannot
 /// reach the migration branch without this seam. Nothing else changes:
-/// production still passes `LEGACY_REPO_CONTRACT_WASM_HASHES`, and both
-/// the probe hashes and the description used in the log line now come
-/// from the same slice, so they cannot disagree.
+/// production still passes `CONTRACT_LINEAGE`, and both the probe
+/// hashes and the note used in the log line come from the same slice,
+/// so they cannot disagree.
 async fn fetch_repo_state_from_registry(
     env: &HelperEnv,
     api: &mut freenet_stdlib::client_api::WebApi,
     repo_wasm: &[u8],
-    registry: &[(&[u8; 32], &str)],
+    registry: &[freenet_migrate::ContractLineageEntry],
 ) -> Result<RepoState> {
     use freenet_git_cli::wsclient::{GetSource, LegacyAwareGet};
 
@@ -343,21 +343,22 @@ async fn fetch_repo_state_from_registry(
         prefix: env.prefix.clone(),
     };
     let params_bytes = params.to_bytes();
-    let legacy_hashes: Vec<&[u8; 32]> = registry.iter().map(|(h, _)| *h).collect();
 
     let LegacyAwareGet { state, source } = wsclient::get_state_with_legacy_fallback(
         api,
         env.contract_id,
         &params_bytes,
-        &legacy_hashes,
+        registry,
         ws_timeout(),
     )
     .await?;
 
     if let GetSource::Legacy { index, instance } = source {
-        let (_, desc) = registry[index];
+        let entry = &registry[index];
         eprintln!(
-            "info: state found at legacy contract {instance} ({desc}); migrating to current key",
+            "info: state found at legacy contract {instance} (generation {}: {}); \
+             migrating to current key",
+            entry.generation, entry.note,
         );
         // Re-PUT to current key. We send the same state bytes — the
         // current contract's validate_state must accept them; if it
@@ -1492,6 +1493,7 @@ mod migration_tests {
 
     use super::fake_gateway::{FakeGateway, Reply};
     use super::*;
+    use freenet_migrate::ContractLineageEntry;
     use freenet_stdlib::prelude::{ContractCode, Parameters};
     use std::collections::HashMap;
 
@@ -1504,8 +1506,8 @@ mod migration_tests {
     }
 
     /// Oracle: derive the contract id the way `freenet-stdlib` does,
-    /// independently of `wsclient::contract_id_from_wasm_hash` (the
-    /// shortcut the migration probe uses).
+    /// independently of `wsclient::legacy_instance_id` (the
+    /// freenet-migrate-backed derivation the migration probe uses).
     fn stdlib_id(wasm: &[u8], params_bytes: &[u8]) -> ContractInstanceId {
         ContractInstanceId::from_params_and_code(
             Parameters::from(params_bytes.to_vec()),
@@ -1589,7 +1591,11 @@ mod migration_tests {
     #[tokio::test]
     async fn recovered_predecessor_state_is_written_forward_to_the_current_key() {
         let f = stranded_repo().await;
-        let registry: &[(&[u8; 32], &str)] = &[(&f.legacy_hash, "0.1.3 repo-contract")];
+        let registry = &[ContractLineageEntry {
+            generation: 1,
+            code_hash: f.legacy_hash,
+            note: "0.1.3 repo-contract",
+        }];
 
         let mut api = wsclient::connect(f.env.ws_url.as_str())
             .await
@@ -1662,7 +1668,11 @@ mod migration_tests {
         let f = stranded_repo().await;
         f.gateway
             .reject_puts("state rejected by contract: validate_state failed");
-        let registry: &[(&[u8; 32], &str)] = &[(&f.legacy_hash, "0.1.3 repo-contract")];
+        let registry = &[ContractLineageEntry {
+            generation: 1,
+            code_hash: f.legacy_hash,
+            note: "0.1.3 repo-contract",
+        }];
 
         let mut api = wsclient::connect(f.env.ws_url.as_str())
             .await
@@ -1684,17 +1694,28 @@ mod migration_tests {
         );
     }
 
-    /// The description printed in the migration log line is indexed out
-    /// of the same registry the hashes came from. Pinning it here means
-    /// a future change that re-splits those two reads (the shape the
-    /// code had before the seam) cannot silently mismatch or panic.
+    /// The note printed in the migration log line is indexed out of the
+    /// same registry slice the hashes came from — and the reported index
+    /// is a SLICE index even though probing is generation-descending.
+    /// The decoy here is the NEWER generation (probed first, absent), so
+    /// the hit is the second probe but slice entry 1; a fallback that
+    /// reported probe position instead of slice position would mislabel
+    /// the log line (or panic) on a real migration.
     #[tokio::test]
     async fn a_second_registry_entry_reports_the_right_index() {
         let f = stranded_repo().await;
         let decoy = *blake3::hash(&synthetic_wasm(0xDD)).as_bytes();
-        let registry: &[(&[u8; 32], &str)] = &[
-            (&decoy, "0.1.2 repo-contract"),
-            (&f.legacy_hash, "0.1.3 repo-contract"),
+        let registry = &[
+            ContractLineageEntry {
+                generation: 2,
+                code_hash: decoy,
+                note: "0.1.4 repo-contract",
+            },
+            ContractLineageEntry {
+                generation: 1,
+                code_hash: f.legacy_hash,
+                note: "0.1.3 repo-contract",
+            },
         ];
 
         let mut api = wsclient::connect(f.env.ws_url.as_str())

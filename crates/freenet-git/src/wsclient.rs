@@ -11,6 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
+use freenet_migrate::{
+    contract_probe, ContractLineageEntry, Outcome, ProbeStateOps, SelectionPolicy, Step,
+};
 use freenet_stdlib::client_api::{
     ClientRequest, ContractRequest, ContractResponse, HostResponse, WebApi,
 };
@@ -184,23 +187,30 @@ pub fn instance_id(key: &ContractKey) -> ContractInstanceId {
     *key.id()
 }
 
-/// Compute a contract instance id from a precomputed WASM hash and
-/// parameters bytes, without needing the full WASM. Used for the
-/// legacy-contract probe path during migration: we don't ship the old
-/// WASM bytes (just their hashes), but we can still derive what the
-/// old contract key would have been for the same prefix.
-///
-/// This duplicates the derivation `freenet_stdlib` does internally
-/// (`BLAKE3(BLAKE3(code) || params)`) but skips the
-/// `BLAKE3(code)` step since we already have it.
-pub fn contract_id_from_wasm_hash(wasm_hash: &[u8; 32], params_bytes: &[u8]) -> ContractInstanceId {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(wasm_hash);
-    hasher.update(params_bytes);
-    let full = hasher.finalize();
+/// Convert an instance id from freenet-migrate's stdlib version (0.8) into
+/// this client's (0.6). The two are nominally distinct Rust types wrapping the
+/// same 32 bytes; nothing about the value changes. Confining the conversion to
+/// this one function (plus the derivation-equivalence test below) keeps the
+/// dual-stdlib boundary from spreading through the client.
+fn to_client_id(id: freenet_stdlib_migrate::prelude::ContractInstanceId) -> ContractInstanceId {
     let mut spec = [0u8; 32];
-    spec.copy_from_slice(full.as_bytes());
+    spec.copy_from_slice(id.as_bytes());
     ContractInstanceId::new(spec)
+}
+
+/// Compute a contract instance id from a registered predecessor generation
+/// and parameters bytes, without needing the old WASM (we ship only its
+/// BLAKE3, in `legacy_contracts.toml`). The derivation
+/// (`BLAKE3(BLAKE3(code) || params)`) is `freenet-migrate`'s
+/// `contract_id_from_code_hash` — the same function every adopter of the
+/// shared migration machinery probes with — converted to this client's
+/// stdlib types at the boundary.
+pub fn legacy_instance_id(entry: &ContractLineageEntry, params_bytes: &[u8]) -> ContractInstanceId {
+    let params = freenet_stdlib_migrate::prelude::Parameters::from(params_bytes.to_vec());
+    to_client_id(freenet_migrate::contract_id_from_code_hash(
+        &entry.code_hash,
+        &params,
+    ))
 }
 
 /// Prefix used in `get_state`'s timeout `bail!` messages. Shared
@@ -410,13 +420,30 @@ fn retry_backoff(attempt: u32) -> Duration {
 /// ceiling is raised later.
 const MAX_BACKOFF_SECS: u64 = 60;
 
-/// GET the repo state at `current_id`; if not found, walk
-/// `legacy_wasm_hashes`, computing the legacy contract key for the
-/// same `params_bytes` and probing each. Returns the first state we
-/// can find, plus an indicator of whether it came from a legacy key
-/// (so the caller can re-PUT it to the current key for migration).
+/// GET the repo state at `current_id`; if not found, walk the registered
+/// predecessor generations in `lineage` (NEWEST generation first — see
+/// below), computing each one's contract key for the same `params_bytes`
+/// and probing it. Returns the first state we can find, plus an indicator
+/// of whether it came from a legacy key (so the caller can re-PUT it to
+/// the current key for migration).
 ///
-/// `timeout` is per-probe, not total — a long list of legacy hashes
+/// The probe sequencing over the legacy generations is `freenet-migrate`'s
+/// backward-probe driver (the same decisions River's shipped UI probe
+/// makes): candidates are ordered by the registry's `generation` field
+/// descending, and the first real (non-empty) state wins. Newest-first is
+/// load-bearing — if two retired generations both still hold state, the
+/// older one can never shadow the newer, so a migration cannot roll a repo
+/// back. One crate default is deliberately overridden: the driver's
+/// recommended "timeout = miss, advance to the next candidate" semantics
+/// would let an OLDER generation's state be adopted while a NEWER one was
+/// merely unreachable — concluding absence from silence. Instead, any
+/// probe outcome that is not authoritative (per-op timeout, gateway
+/// backpressure, transport error) aborts the whole pass, and the pass is
+/// retried; only an authoritative NotFound/empty advances the walk
+/// (freenet-migrate#19: present / genuinely absent / unknown must stay a
+/// three-way distinction, and unknown means retry, never conclude).
+///
+/// `timeout` is per-probe, not total — a long list of legacy generations
 /// can take O(N × timeout) in the worst case.
 ///
 /// On failure, the returned error describes the dominant outcome
@@ -425,7 +452,7 @@ const MAX_BACKOFF_SECS: u64 = 60;
 /// logs: a transient gateway slowdown that times out every probe used
 /// to bail with "no state found at current contract key or any of N
 /// legacy keys", indistinguishable from genuine data loss. The new
-/// message says "all N+1 probes timed out", which is actionable.
+/// message says "all N probes timed out", which is actionable.
 ///
 /// Transient failures are retried up to [`PROBE_MAX_ATTEMPTS`] times
 /// with exponential backoff ([`retry_backoff`]). A retry fires when at
@@ -442,20 +469,12 @@ pub async fn get_state_with_legacy_fallback(
     web_api: &mut WebApi,
     current_id: ContractInstanceId,
     params_bytes: &[u8],
-    legacy_wasm_hashes: &[&[u8; 32]],
+    lineage: &[ContractLineageEntry],
     timeout: Duration,
 ) -> Result<LegacyAwareGet> {
     let mut attempt = 1u32;
     loop {
-        match probe_all_keys(
-            web_api,
-            current_id,
-            params_bytes,
-            legacy_wasm_hashes,
-            timeout,
-        )
-        .await
-        {
+        match probe_all_keys(web_api, current_id, params_bytes, lineage, timeout).await {
             Ok(found) => return Ok(found),
             Err(outcomes) => {
                 // Stop on the final attempt, or when the failure is not
@@ -483,29 +502,70 @@ pub async fn get_state_with_legacy_fallback(
 /// Backoff sleeps add at most 2+4+8 = 14s across the 4 attempts. The
 /// dominant cost, though, is the probes themselves: a `Timeout`
 /// outcome is retryable but each timed-out probe burns a full per-op
-/// `timeout` (default 180s), and every attempt re-probes the current
-/// key plus all `legacy_wasm_hashes`. So the all-timeout worst case is
-/// roughly `PROBE_MAX_ATTEMPTS × (1 + legacy_keys) × timeout + 14s`,
-/// NOT 14s. With freenet-core's mirror (0 legacy keys) that is
-/// `4 × 180 + 14 ≈ 12 min`, safely inside the job's 30-minute cap. If
-/// `legacy_wasm_hashes` grows (or this constant is raised), revisit
-/// that budget — and the push path's `put_pack` retries run *after*
-/// this probe within the same job.
+/// `timeout` (default 180s). A pass aborts at its FIRST non-
+/// authoritative outcome, so the all-timeout worst case is roughly
+/// `PROBE_MAX_ATTEMPTS × timeout + 14s ≈ 12 min` with the default
+/// timeout, safely inside the mirror job's 30-minute cap — but a pass
+/// can also burn up to `(1 + lineage.len()) × timeout` when earlier
+/// probes resolve authoritatively and a LATER one times out. If the
+/// lineage grows (or this constant is raised), revisit that budget —
+/// and the push path's `put_pack` retries run *after* this probe
+/// within the same job.
 const PROBE_MAX_ATTEMPTS: u32 = 4;
 
-/// Run one full probe pass: try the current key, then each legacy key.
+/// App-side state semantics for the legacy backward probe: the fallback is
+/// agnostic to the state's content (the caller decodes via
+/// `RepoState::from_bytes`), so a candidate "hit" is exactly a non-empty
+/// byte string — the same criterion the hand-rolled walk used.
+///
+/// `merge_with_local` keeps the recovered bytes untouched: a git remote
+/// helper is stateless (there is no device-local snapshot to fold in), and
+/// the forward PUT relies on the repo contract's own on-network
+/// `validate_state`/merge, exactly as before. `RepoState` is not a
+/// `freenet-scaffold` `ComposableState`, so the crate's local
+/// `CarryForward` fold does not apply here.
+struct RawStateOps;
+
+impl ProbeStateOps for RawStateOps {
+    type State = Vec<u8>;
+
+    fn decode(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+        Some(bytes.to_vec())
+    }
+
+    fn is_real(&self, state: &Vec<u8>) -> bool {
+        !state.is_empty()
+    }
+
+    fn merge_with_local(&self, recovered: Vec<u8>, _local: &Vec<u8>) -> Vec<u8> {
+        recovered
+    }
+}
+
+/// Run one full probe pass: try the current key, then walk the legacy
+/// generations newest-first via `freenet-migrate`'s probe driver.
 /// `Ok` on the first non-empty hit; `Err(outcomes)` with the per-probe
-/// outcome list when every key fails (so the caller can decide whether
+/// outcome list when the pass fails (so the caller can decide whether
 /// the failure is transient and worth retrying).
+///
+/// The driver owns the candidate order, the hit criterion, and when the
+/// walk advances; this pump owns the I/O and the absent-vs-unknown
+/// classification. Only an authoritative per-key answer (`NotFound` or an
+/// empty response) advances the walk — it is delivered to the driver as a
+/// miss. Anything non-authoritative (timeout, backpressure, transport
+/// error) aborts the pass instead, so silence is never treated as
+/// absence and an older generation is never adopted past an unreachable
+/// newer one (the freenet-migrate#19 override; see
+/// [`get_state_with_legacy_fallback`]).
 async fn probe_all_keys(
     web_api: &mut WebApi,
     current_id: ContractInstanceId,
     params_bytes: &[u8],
-    legacy_wasm_hashes: &[&[u8; 32]],
+    lineage: &[ContractLineageEntry],
     timeout: Duration,
 ) -> std::result::Result<LegacyAwareGet, Vec<(String, ProbeOutcome)>> {
     // Probe outcomes, in (label, outcome) form. Filled as we go;
-    // returned to the caller if every probe fails.
+    // returned to the caller if the pass fails.
     let mut outcomes: Vec<(String, ProbeOutcome)> = Vec::new();
 
     // Fast path: try the current key first.
@@ -522,34 +582,92 @@ async fn probe_all_keys(
         Err(e) => {
             let outcome = ProbeOutcome::from_get_state_err(&e);
             tracing::debug!("current-key GET failed: {e}; trying legacy fallback");
+            let authoritative =
+                matches!(outcome.retry_disposition(), RetryDisposition::Authoritative);
             outcomes.push((format!("current key {current_id}"), outcome));
+            if !authoritative {
+                // Unknown whether the current key holds state — do not
+                // walk predecessors on top of that uncertainty (a legacy
+                // hit here could serve a stale generation while the
+                // current key was merely slow). Retry the whole pass.
+                return Err(outcomes);
+            }
         }
     }
 
-    // Legacy probes.
-    for (idx, legacy_hash) in legacy_wasm_hashes.iter().enumerate() {
-        let legacy_id = contract_id_from_wasm_hash(legacy_hash, params_bytes);
+    // Legacy generations, sequenced by the shared probe driver
+    // (newest generation first, first real state wins).
+    //
+    // `(slice index, client-side id, driver-side id)` per entry, derived
+    // once: the driver speaks freenet-migrate's stdlib types, the wire
+    // client this crate's, and the slice index is what `GetSource::Legacy`
+    // reports back to the caller (which indexes the same `lineage` slice
+    // for its log line).
+    let candidates: Vec<(usize, ContractInstanceId)> = lineage
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| (idx, legacy_instance_id(entry, params_bytes)))
+        .collect();
+    let lookup = |driver_id: freenet_stdlib_migrate::prelude::ContractInstanceId| {
+        candidates
+            .iter()
+            .find(|(_, client_id)| client_id.as_bytes() == driver_id.as_bytes())
+            .copied()
+            .expect("driver candidates are derived from the same lineage")
+    };
+
+    let params = freenet_stdlib_migrate::prelude::Parameters::from(params_bytes.to_vec());
+    let mut driver = contract_probe(
+        RawStateOps,
+        Vec::new(),
+        &params,
+        lineage,
+        SelectionPolicy::NewestFirstWins,
+    );
+    while let Step::Get(driver_id) = driver.next_action() {
+        let (idx, legacy_id) = lookup(driver_id);
         let label = format!("legacy key {idx} ({legacy_id})");
         match get_state(web_api, legacy_id, false, timeout).await {
-            Ok(state) if !state.is_empty() => {
-                return Ok(LegacyAwareGet {
-                    state,
-                    source: GetSource::Legacy {
-                        index: idx,
-                        instance: legacy_id,
-                    },
-                });
+            Ok(state) => {
+                if state.is_empty() {
+                    outcomes.push((label, ProbeOutcome::Empty));
+                }
+                // Non-empty is a hit (`is_real`); empty is a miss
+                // the driver advances past.
+                driver.on_response(driver_id, &state);
             }
-            Ok(_) => outcomes.push((label, ProbeOutcome::Empty)),
             Err(e) => {
                 let outcome = ProbeOutcome::from_get_state_err(&e);
                 tracing::debug!("legacy probe {idx} failed: {e}");
+                let authoritative =
+                    matches!(outcome.retry_disposition(), RetryDisposition::Authoritative);
                 outcomes.push((label, outcome));
+                if authoritative {
+                    // NotFound is authoritative for THIS key only:
+                    // deliver it as a per-candidate miss so the
+                    // walk advances to the next-older generation.
+                    driver.on_timeout(driver_id);
+                } else {
+                    // Unknown → abort the pass; never conclude
+                    // absence (or adopt an older generation) from
+                    // silence.
+                    return Err(outcomes);
+                }
             }
         }
     }
-
-    Err(outcomes)
+    match driver.take_outcome() {
+        Some(Outcome::Recovered { merged, source, .. }) => {
+            let (index, instance) = lookup(source);
+            Ok(LegacyAwareGet {
+                state: merged,
+                source: GetSource::Legacy { index, instance },
+            })
+        }
+        // Every candidate authoritatively missed (or there were none):
+        // the recorded outcomes say why.
+        Some(Outcome::SeedLocal { .. }) | Some(Outcome::NoLegacy { .. }) | None => Err(outcomes),
+    }
 }
 
 /// Build the final error returned when every probe in
@@ -647,9 +765,11 @@ pub struct LegacyAwareGet {
 pub enum GetSource {
     /// The current contract key.
     Current,
-    /// A legacy contract key, indexed into `legacy_wasm_hashes`.
+    /// A legacy contract key, indexed into the lineage slice the caller
+    /// passed (slice order, not probe order — probing is newest-
+    /// generation-first).
     Legacy {
-        /// Index in the legacy hash array.
+        /// Index in the caller's lineage slice.
         index: usize,
         /// The legacy contract instance id (so the caller can log it).
         instance: ContractInstanceId,
@@ -672,10 +792,10 @@ enum GetDispatch {
     /// Distinct from `State(Vec::new())` so callers like `get_pack`
     /// (which BLAKE3-verifies the returned bytes) don't conflate
     /// "host says missing" with "host returned a real zero-length
-    /// payload". The legacy-fallback caller already swallows errors
-    /// from `get_state` via its `Err(e) => log + fall-through` arm,
-    /// so propagating absence as `Err` preserves the existing
-    /// migration semantics there.
+    /// payload". The legacy-fallback caller classifies this error as
+    /// authoritative per-key absence ([`ProbeOutcome::NotFound`]) and
+    /// advances its walk to the next generation, so propagating
+    /// absence as `Err` preserves the migration semantics there.
     NotFound,
     /// Caller should skip and keep waiting on the recv loop.
     Continue,
@@ -744,9 +864,11 @@ fn dispatch_get_response(response: HostResponse, id: ContractInstanceId) -> GetD
 /// don't BLAKE3-verify empty bytes against a nonzero expected hash.
 ///
 /// The legacy-fallback caller [`get_state_with_legacy_fallback`]
-/// already treats any error from `get_state` as "try the next legacy
-/// key, then bail", so propagating absence as `Err` preserves its
-/// existing migration semantics.
+/// classifies every error from `get_state`: an authoritative NotFound
+/// advances its walk to the next legacy generation, while a
+/// non-authoritative failure (timeout, backpressure, transport) aborts
+/// the pass for a retry — so propagating absence as `Err`, distinctly
+/// worded, is load-bearing for its migration semantics.
 ///
 /// Setting `subscribe: true` is intentional: we want the local node to
 /// keep the contract live for us so subsequent pushes/fetches don't have
@@ -1128,9 +1250,16 @@ mod tests {
     use super::*;
     use freenet_stdlib::prelude::{ContractCode, Parameters};
 
-    /// `contract_id_from_wasm_hash` must produce exactly the same id
-    /// as `ContractInstanceId::from_params_and_code` would, given the
-    /// matching WASM bytes whose BLAKE3 we're shortcutting.
+    /// [`legacy_instance_id`] must produce exactly the same id as this
+    /// client's stdlib (`ContractInstanceId::from_params_and_code`) would,
+    /// given the matching WASM bytes whose BLAKE3 the registry stores.
+    ///
+    /// This is the dual-stdlib boundary pin: the derivation runs in
+    /// `freenet-migrate` over stdlib-0.8 types and is converted to this
+    /// client's stdlib-0.6 id via [`to_client_id`]. The oracle side is
+    /// derived entirely with the 0.6 stdlib this client sends GETs with,
+    /// so a drift in the crate's derivation OR a byte-order bug in the
+    /// conversion probes a key that never existed — and fails here.
     #[test]
     fn legacy_id_derivation_matches_full_derivation() {
         let fake_wasm: Vec<u8> = (0..1024u32).map(|i| (i & 0xFF) as u8).collect();
@@ -1141,7 +1270,12 @@ mod tests {
             Parameters::from(params_bytes.clone()),
             ContractCode::from(fake_wasm),
         );
-        let shortcut = contract_id_from_wasm_hash(&wasm_hash, &params_bytes);
+        let entry = ContractLineageEntry {
+            generation: 1,
+            code_hash: wasm_hash,
+            note: "test",
+        };
+        let shortcut = legacy_instance_id(&entry, &params_bytes);
         assert_eq!(full, shortcut);
     }
 
@@ -1287,9 +1421,9 @@ mod tests {
     /// client used to ignore that arm via the `_ =>` fallback.
     ///
     /// Surfacing `NotFound` as `GetDispatch::NotFound` lets `get_state`
-    /// `bail!` immediately; `get_state_with_legacy_fallback` already
-    /// swallows `Err(_)` via its `Err(e) => tracing::debug!` arm and
-    /// moves on to the next legacy probe (or bails with "no state
+    /// `bail!` immediately; `get_state_with_legacy_fallback` classifies
+    /// that error as authoritative per-key absence and advances its
+    /// walk to the next legacy generation (or bails with "no state
     /// found …" if none remain), so the migration-friendly semantics
     /// are preserved without the recv-loop deadlock.
     #[test]

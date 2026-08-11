@@ -633,16 +633,11 @@ fn rescue(
             prefix: parsed.prefix.clone(),
         };
         let params_bytes = params.to_bytes();
-        let legacy_hashes: Vec<&[u8; 32]> =
-            freenet_git_cli::legacy::LEGACY_REPO_CONTRACT_WASM_HASHES
-                .iter()
-                .map(|(h, _)| *h)
-                .collect();
         let result = wsclient::get_state_with_legacy_fallback(
             &mut api,
             contract_id,
             &params_bytes,
-            &legacy_hashes,
+            freenet_git_cli::legacy::CONTRACT_LINEAGE,
             timeout,
         )
         .await?;
