@@ -1,0 +1,46 @@
+# BLAKE3 hashes of the contract WASM, checked by `scripts/check-contract-wasm.sh`
+# (CI job `contract-wasm`). Format: <blake3-hex> <two spaces> <path>.
+#
+# A contract's on-network address is `BLAKE3(BLAKE3(wasm) || serialize(params))`,
+# so these bytes ARE the address. Every line here is load-bearing; do not edit one
+# to make CI green without reading what it means.
+#
+# There are two DIFFERENT facts recorded below, and the difference is the point.
+#
+# 1. The two `crates/freenet-git/contracts/*.wasm` lines are the checked-in
+#    artifacts. `src/lib.rs` embeds them with `include_bytes!`, so they are what
+#    the shipped binary PUTs and addresses. A change to one of these hashes is a
+#    live re-key of every repo (repo-contract) or every pack (pack-contract) on
+#    the network. Do not update such a line without following the migration
+#    procedure in `legacy_contracts.toml`. (repo-contract's hash is additionally
+#    pinned, in base58, by `tests/migration_guard.rs`, which enforces that
+#    procedure; pack-contract has no migration path at all yet — issue #64 — so
+#    for it this line is currently the only tripwire.)
+#
+# 2. The two `target/...` lines are what the contract SOURCES compile to today,
+#    under the committed `Cargo.lock` and the pinned toolchain, built by
+#    `scripts/build-contracts.sh`. Nothing ships these bytes. They are recorded
+#    so that a change to a build input — a Dependabot bump to `Cargo.lock` above
+#    all, but equally a `rust-toolchain.toml` bump or an edit to the contract
+#    crates or their workspace-internal dependencies — turns into a red CI job on
+#    the PR that introduces it, instead of lying dormant until the next person to
+#    rebuild ships it. Updating one of these lines is not itself a re-key; it is
+#    an acknowledgement that the re-key a future rebuild will carry just got
+#    bigger.
+#
+# THE TWO SETS DO NOT AGREE TODAY, AND THAT IS A KNOWN, TRACKED DEFECT.
+# The artifacts were last built on 2026-04-30 (b8edf90) and the sources have
+# moved since, so `repo-contract.wasm` on the network does not contain the
+# `get_state_delta` fix its source has carried since #62. That is issue #63,
+# which also asks for exactly this gate. When #63 is resolved by rebuilding and
+# committing the artifacts under the migration procedure, the artifact hash and
+# the rebuild hash for each contract become equal, and the check below reports
+# them as in sync.
+
+# --- checked-in artifacts: these ARE the deployed contract addresses ---
+a397cc99e79f99e2d320a24b0d4db5f6ab36d1f35e8454c87bf996e249ad9c13  crates/freenet-git/contracts/repo-contract.wasm
+4140e677d7715f74805d958a47c52ec13b174dcda77ccfb6fa30204f257a0a87  crates/freenet-git/contracts/pack-contract.wasm
+
+# --- what the sources compile to now: drift detector, ships nothing ---
+303cd2a6f8e23adf680dc11d74a56b12a8248d4df57f30a4bc997c201beb43c4  target/wasm32-unknown-unknown/release/freenet_git_repo_contract.wasm
+188cb7d49354f5b4ad89052ccc71d97e1484ce44821eb0b16f19031c3a1e9a89  target/wasm32-unknown-unknown/release/freenet_git_pack_contract.wasm

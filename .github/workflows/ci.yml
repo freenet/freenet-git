@@ -68,3 +68,44 @@ jobs:
           cargo test -p freenet-git-identity \
             regenerate_wire_format_fixtures -- --ignored --nocapture
           cargo test -p freenet-git-identity --test wire_format
+
+  # The contract-address gate. A Freenet contract's on-network address is
+  # BLAKE3(BLAKE3(wasm) || serialize(params)), so the compiled bytes of
+  # pack-contract and repo-contract ARE the addresses of every pack and every
+  # repo published with this tool. The artifacts are checked in and embedded by
+  # `include_bytes!`, and until this job nothing rebuilt or verified them
+  # (issue #63, which asks for exactly this) -- so a change to any build input
+  # could move what the sources compile to while every other job stayed green.
+  #
+  # Dependabot makes that concrete: it opens grouped cargo PRs against the
+  # workspace `Cargo.lock`, which is shared by the two contract crates, so a
+  # bump anywhere in the workspace can move contract bytes. Verified locally on
+  # this tree: `cargo update -p blake3` alone (1.8.5 -> 1.8.7, a nine-line
+  # lockfile diff) changes both contracts' compiled hashes.
+  #
+  # This job does not (and must not) refresh the checked-in artifact when it
+  # drifts: that would silently re-key live data. It fails instead, so the
+  # re-key becomes a deliberate step under the migration procedure in
+  # `crates/freenet-git/legacy_contracts.toml`.
+  contract-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No toolchain action: rust-toolchain.toml pins the channel and the
+      # wasm32 target, and `rustup toolchain install` with no argument installs
+      # exactly that. Naming a version here too would let the two drift, and
+      # the compiled bytes -- hence the contract address -- depend on the exact
+      # compiler.
+      - run: rustup toolchain install && rustup show
+      - uses: Swatinem/rust-cache@v2
+      # RUSTFLAGS is cleared for the install only: the workflow-level
+      # `-D warnings` applies to whatever is compiled here, and a warning in one
+      # of b3sum's dependencies would fail the job for a reason unrelated to
+      # what it checks. The contract build sets its own RUSTFLAGS (see
+      # scripts/build-contracts.sh) and is unaffected either way.
+      - name: Install b3sum
+        env:
+          RUSTFLAGS: ""
+        run: command -v b3sum || cargo install b3sum --locked
+      - name: Contract WASM matches the recorded hashes
+        run: ./scripts/check-contract-wasm.sh
