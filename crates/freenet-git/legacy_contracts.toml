@@ -40,6 +40,11 @@
 #      test fails with instructions until both edits are made.
 #   4. Make your code changes, rebuild, copy the new WASM into the
 #      contracts/ directory, ship.
+#   5. Update the matching line in `contracts/wasm-hashes.txt` (both the
+#      artifact hash and, since a rebuild-and-ship makes the two agree,
+#      the compiled-from-source hash). The `contract-wasm` CI job fails
+#      until it is recorded — that is what stops a re-key from riding
+#      along inside an unrelated change.
 #
 # Probing is newest-first (highest `generation` first), so if several
 # generations still hold state, the most recent one wins and older

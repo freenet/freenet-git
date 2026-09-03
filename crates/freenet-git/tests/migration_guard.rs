@@ -1,13 +1,20 @@
 //! The re-key guard: "if the committed repo-contract WASM changed, its
 //! previous hash must be registered in `legacy_contracts.toml`".
 //!
-//! `contracts/repo-contract.wasm` is a checked-in artifact, and CI
-//! neither rebuilds nor verifies it (freenet-git#63) — so before this
-//! guard, nothing stopped a PR from swapping the WASM (a re-key of
+//! `contracts/repo-contract.wasm` is a checked-in artifact — so before
+//! this guard, nothing stopped a PR from swapping the WASM (a re-key of
 //! EVERY repo on the network) without registering the outgoing hash,
 //! which would strand all existing repos with no migration path. That
 //! is the exact failure `freenet-migrate-build`'s `check_migration_guard`
 //! exists for; this wires it to the committed artifact.
+//!
+//! This guard covers the artifact only. Whether that artifact still
+//! matches what the contract SOURCES compile to is a separate question,
+//! and the answer is currently no (freenet-git#63): the artifact was
+//! last built 2026-04-30. The `contract-wasm` CI job
+//! (`scripts/check-contract-wasm.sh`) rebuilds and records both, so a
+//! build-input change — a Dependabot bump to `Cargo.lock` above all —
+//! cannot enlarge that gap unnoticed.
 //!
 //! The pinned hash below is the "base" side of the guard (what River's
 //! CI derives from the git merge-base). Pinning it as a literal keeps
