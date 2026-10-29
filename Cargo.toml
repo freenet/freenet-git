@@ -57,7 +57,7 @@ clap = { version = "4.5", features = ["derive", "env"] }
 rpassword = "7"
 
 # Freenet
-freenet-stdlib = { version = "0.6.0" }
+freenet-stdlib = { version = "0.8.5" }
 
 # Shared upgrade-migration machinery — BUILD half only (registry schema,
 # build-time hash validation, codegen, and the re-key CI guard). It has no
