@@ -669,7 +669,7 @@ dependencies = [
  "bs58",
  "chacha20poly1305",
  "ed25519-dalek",
- "getrandom 0.2.17",
+ "getrandom 0.4.2",
  "rand 0.8.6",
  "scrypt",
  "serde",
