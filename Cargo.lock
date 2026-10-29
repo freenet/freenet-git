@@ -141,6 +141,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bincode"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd6a120d2e16b3e1b4a24bd70f23b12d3e16b81f113364a26935f8db7245452d"
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -623,7 +629,7 @@ version = "0.1.27"
 dependencies = [
  "anyhow",
  "assert_cmd",
- "bincode",
+ "bincode 3.0.0",
  "blake3",
  "bs58",
  "clap",
@@ -664,7 +670,7 @@ dependencies = [
 name = "freenet-git-identity"
 version = "0.1.27"
 dependencies = [
- "bincode",
+ "bincode 3.0.0",
  "blake3",
  "bs58",
  "chacha20poly1305",
@@ -691,7 +697,7 @@ dependencies = [
 name = "freenet-git-repo-contract"
 version = "0.1.27"
 dependencies = [
- "bincode",
+ "bincode 3.0.0",
  "ed25519-dalek",
  "freenet-git-types",
  "freenet-stdlib",
@@ -701,7 +707,7 @@ dependencies = [
 name = "freenet-git-types"
 version = "0.1.27"
 dependencies = [
- "bincode",
+ "bincode 3.0.0",
  "blake3",
  "bs58",
  "ed25519-compact",
@@ -741,7 +747,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4aa02deacddb55332a7dcb6ef3b3afef6e633d4fcbc3730df4f1e34cd7ce84d2"
 dependencies = [
- "bincode",
+ "bincode 1.3.3",
  "blake3",
  "bs58",
  "byteorder",
