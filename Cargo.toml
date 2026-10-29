@@ -22,7 +22,7 @@ authors = ["Freenet Project"]
 
 [workspace.dependencies]
 # Crypto
-ed25519-dalek = { version = "2.1", default-features = false, features = ["alloc", "rand_core", "zeroize"] }
+ed25519-dalek = { version = "3.0", default-features = false, features = ["alloc", "rand_core", "zeroize"] }
 ed25519-compact = { version = "2.1", default-features = false, features = ["std"] }
 blake3 = { version = "1.5", default-features = false, features = ["std"] }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng", "getrandom"] }
