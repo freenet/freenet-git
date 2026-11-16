@@ -105,7 +105,7 @@ jobs:
       # repos in the future this should be revisited.
       - name: Clone upstream for --from
         if: matrix.github_repo != ''
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ matrix.github_repo }}
           path: upstream
