@@ -11,12 +11,22 @@ remote helper.
 Hosted on Freenet and clonable today:
 
 ```sh
-# freenet-core HEAD source snapshot (no full history)
+# freenet-core snapshot mirror: HEAD source only, no full history, no tags
 git clone freenet::3GEERif5ihbf/freenet-core
 
-# freenet-stdlib full git history (177 commits)
+# freenet-stdlib full git history + release tags
 git clone freenet::96rknpy1GYhZ/freenet-stdlib
+
+# freenet-git itself, full git history -- the tool publishes itself
+git clone freenet::99TmCayXn6Tm/freenet-git
 ```
+
+History-mode mirrors carry tags (both annotated and lightweight)
+once a mirror push from 0.1.20+ has landed, so `git ls-remote
+freenet::...` lists them and `git checkout v0.1.22` works on a
+fresh clone. Snapshot-mode mirrors deliberately skip tags: each
+push builds a fresh orphan commit and upstream tags point at
+commits not in that bundle.
 
 Requires `cargo install freenet-git` and a running local Freenet node.
 See "Quick start" below.
@@ -58,9 +68,9 @@ This installs both `freenet-git` (the companion CLI) and
 ### 2. Run a local Freenet node
 
 You need a Freenet node running locally to talk to. See the
-[Freenet getting-started guide](https://docs.freenet.org/). The
+[Freenet quickstart](https://freenet.org/quickstart/). The
 WebSocket API endpoint defaults to
-`ws://127.0.0.1:7509/v1/contract/command`.
+`ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native`.
 
 ### 3. Clone a live repo
 
@@ -85,6 +95,22 @@ git remote add freenet freenet::RtTzy58hMxAB/my-project
 export FREENET_GIT_PASSPHRASE='your-passphrase'
 git push freenet main
 ```
+
+`init-identity` asks you to choose a passphrase when it runs on a
+terminal. If `FREENET_GIT_PASSPHRASE` is set, it uses that value
+instead of prompting, and `--no-passphrase` skips the passphrase
+entirely.
+
+`freenet-git create` is the step that actually publishes the repo
+contract, and it prints `PUT confirmed by host` when that lands.
+`git remote add` publishes nothing on its own, so it is not a
+substitute. If you publish to a non-default node with `--publish-to`,
+set `FREENET_GIT_WS_URL` to that same node before pushing: `git push`
+reads that variable and knows nothing about `--publish-to`. Give the
+full value, including the `?encodingProtocol=native` suffix, for example
+`export FREENET_GIT_WS_URL='ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native'`.
+Without the suffix the helper fails with "comm channel between
+client/host closed".
 
 ### Passphrase handling
 
@@ -232,6 +258,64 @@ This re-PUTs every bundle and chunk the repo references, which
 re-broadcasts each to whichever peers subscribe to that contract's
 location and bumps it back to the top of their LRU cache.
 
+Rescue **auto-detects snapshot vs history mode** from a signed
+`mirror-mode` extension that the helper writes on push (when the
+publisher's workflow sets the `FREENET_GIT_MIRROR_MODE` env var,
+which the bundled `mirror-repo.yml` reusable workflow does
+automatically since 0.1.19). For snapshot-mode contracts this
+skips bundles whose tip is no longer reachable from any current
+ref — dropping freenet-core-style rescues from N bundles to ~1 —
+with no per-call flag.
+
+### Transition window
+
+For snapshot-mode contracts published before 0.1.19, the
+`mirror-mode` extension is not yet on the contract. Auto-detect
+returns "unknown" and rescue defaults to the legacy "rescue
+everything" behaviour until the first 0.1.19+ push lands. During
+this window keep passing `--only-current-tips` explicitly:
+
+```sh
+freenet-git rescue freenet:<prefix>/<label> --only-current-tips
+```
+
+After the next mirror push from a 0.1.19+ workflow run records
+the extension, the manual flag is no longer needed.
+
+**Do not pass `--only-current-tips` for history-mode mirrors** —
+the older bundles' tips are ancestor commits, not current ref
+values, and the flag would incorrectly skip them.
+
+### Overriding auto-detect
+
+If auto-detect is wrong (stale metadata, a contract that
+transitioned from snapshot to history without a fresh contract
+URL, or a malformed `mirror-mode` value), use `--rescue-all` to
+force a full rescue regardless of what the contract says:
+
+```sh
+freenet-git rescue freenet:<prefix>/<label> --rescue-all
+```
+
+`--rescue-all` and `--only-current-tips` are mutually exclusive.
+
+### Publishing from the CLI
+
+If you push to a contract directly with `git push freenet::...`
+(not through the bundled `mirror-repo.yml` workflow), set
+`FREENET_GIT_MIRROR_MODE` so rescue knows which filter to apply
+later:
+
+```sh
+FREENET_GIT_MIRROR_MODE=snapshot git push freenet::<prefix>/<label> +main:main
+# or
+FREENET_GIT_MIRROR_MODE=history git push freenet::<prefix>/<label> main:main
+```
+
+The env var only needs to be set when the mode changes or on the
+first push from 0.1.19+; the helper skips the extension write
+when the contract already records the correct value.
+
 For repos you publish and want to keep reachable, run rescue as a
 cron job (e.g. once a day or a few times a week) from a node that
 holds the data. The demo URLs above are kept alive by the
@@ -248,9 +332,67 @@ the contract. Schedule mirror crons aggressively without worrying
 about contract churn -- they only do work when the source
 actually moved.
 
-A future release will add `freenet-git rescue --from <git-dir>`
-so any clone-holder can rescue from their working tree even if
-the local node's cache has also forgotten.
+If the local node's cache has forgotten the bytes too, rescue can
+rebuild them from a clone instead of fetching them:
+
+```sh
+freenet-git rescue freenet:<prefix>/<label> --from ~/code/my-project/.git
+```
+
+Pack output is deterministic for a given object set and git version,
+so the rebuilt pack is byte-for-byte the one the contract references.
+This covers history-mode mirrors with `SinglePack` bundles; snapshot
+mirrors and chunked bundles still use the fetch-only path, because
+their reconstruction shape is not recoverable from the contract
+metadata today.
+
+## Troubleshooting
+
+### `UPDATE failed: missing contract` when pushing
+
+```text
+error: ... UPDATE failed: missing contract: <id>
+```
+
+**If you are on 0.1.24 or earlier, upgrade.** Every push failed this
+way. freenet-git sent a placeholder value where the update request
+carries the contract's code hash, and recent Freenet nodes look the
+contract up by exactly that hash, so the lookup could never match. The
+message named the network, but nothing was wrong with the network, the
+node, or the repo. `cargo install freenet-git` picks up the fix.
+
+On 0.1.25+ this means the node genuinely could not resolve the contract
+to apply your update to. It is still a local condition despite the
+host's wording: an update is applied on your own node before it is sent
+to the network. Check:
+
+* **Are you pushing through the node the repo was published to?**
+  `git push` uses `FREENET_GIT_WS_URL` (default
+  `ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native`),
+  while `freenet-git create` uses `--publish-to`. If those differ,
+  point them at the same node.
+* **Is that node running and past startup?**
+* **Was the repo ever published?** `freenet-git create` prints
+  `PUT confirmed by host` when it lands. With `--no-publish` nothing
+  was published, and you need the `fdev publish` command that `create`
+  printed for you.
+
+### `this identity cannot sign pushes to <prefix>`
+
+Every repo has its own keypair, held in the identity bundle that
+created it. The error lists the repos the current bundle can push to.
+Either point `FREENET_GIT_IDENTITY` at the bundle that owns the repo,
+or, if you are trying to contribute to someone else's repo, publish
+your own clone and send them the URL (see "Sending changes to a
+maintainer"). There is no shared-write mode yet; that is Phase 1.1.
+
+### `exhausted all peers` during clone or fetch
+
+The contract is published but its pack bytes have fallen out of the
+network's caches. Ask whoever publishes it to run `freenet-git rescue`
+(see "Keeping a published repo alive"). Repos with no one running
+rescue will eventually become unclonable; that is the current
+durability model, not a bug.
 
 ## How URLs work
 
@@ -344,7 +486,9 @@ Working today:
 - fetch and clone through Git's remote-helper protocol
 - clone live demo repos from the public Freenet network
 - `freenet-git rescue <url>` to re-PUT a repo's bundles when chunks
-  evict from the wider network (cures `exhausted all peers` errors)
+  evict from the wider network (cures `exhausted all peers` errors),
+  with `--from <git-dir>` to rebuild packs the local node has also
+  forgotten
 
 Not yet supported:
 
