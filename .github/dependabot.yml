@@ -70,6 +70,15 @@ updates:
     labels:
       - "dependencies"
       - "contract-rekey-risk"
+    ignore:
+      # Bumping freenet-stdlib changes the compiled repo/pack contract WASM and
+      # re-keys every published repo. Only bump it as a planned re-key, with a
+      # legacy_contracts.toml migration entry.
+      - dependency-name: "freenet-stdlib"
+      # bincode 3.0.0 is a tombstone release containing only a compile_error!,
+      # so every 3.x version fails to build.
+      - dependency-name: "bincode"
+        versions: [">= 3"]
     groups:
       cargo-minor-and-patch:
         patterns:

@@ -14,7 +14,7 @@ Hosted on Freenet and clonable today:
 # freenet-core snapshot mirror: HEAD source only, no full history, no tags
 git clone freenet::3GEERif5ihbf/freenet-core
 
-# freenet-stdlib full git history (177 commits) + release tags
+# freenet-stdlib full git history + release tags
 git clone freenet::96rknpy1GYhZ/freenet-stdlib
 
 # freenet-git itself, full git history -- the tool publishes itself
@@ -23,7 +23,7 @@ git clone freenet::99TmCayXn6Tm/freenet-git
 
 History-mode mirrors carry tags (both annotated and lightweight)
 once a mirror push from 0.1.20+ has landed, so `git ls-remote
-freenet::...` lists them and `git checkout v0.6.0` works on a
+freenet::...` lists them and `git checkout v0.1.22` works on a
 fresh clone. Snapshot-mode mirrors deliberately skip tags: each
 push builds a fresh orphan commit and upstream tags point at
 commits not in that bundle.
@@ -68,9 +68,9 @@ This installs both `freenet-git` (the companion CLI) and
 ### 2. Run a local Freenet node
 
 You need a Freenet node running locally to talk to. See the
-[Freenet getting-started guide](https://docs.freenet.org/). The
+[Freenet quickstart](https://freenet.org/quickstart/). The
 WebSocket API endpoint defaults to
-`ws://127.0.0.1:7509/v1/contract/command`.
+`ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native`.
 
 ### 3. Clone a live repo
 
@@ -96,12 +96,21 @@ export FREENET_GIT_PASSPHRASE='your-passphrase'
 git push freenet main
 ```
 
+`init-identity` asks you to choose a passphrase when it runs on a
+terminal. If `FREENET_GIT_PASSPHRASE` is set, it uses that value
+instead of prompting, and `--no-passphrase` skips the passphrase
+entirely.
+
 `freenet-git create` is the step that actually publishes the repo
 contract, and it prints `PUT confirmed by host` when that lands.
 `git remote add` publishes nothing on its own, so it is not a
 substitute. If you publish to a non-default node with `--publish-to`,
 set `FREENET_GIT_WS_URL` to that same node before pushing: `git push`
-reads that variable and knows nothing about `--publish-to`.
+reads that variable and knows nothing about `--publish-to`. Give the
+full value, including the `?encodingProtocol=native` suffix, for example
+`export FREENET_GIT_WS_URL='ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native'`.
+Without the suffix the helper fails with "comm channel between
+client/host closed".
 
 ### Passphrase handling
 
