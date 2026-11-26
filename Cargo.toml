@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.27"
+version = "0.1.28"
 edition = "2021"
 # 1.87 is freenet-migrate-build's MSRV; the toolchain is pinned well above
 # it in rust-toolchain.toml.
