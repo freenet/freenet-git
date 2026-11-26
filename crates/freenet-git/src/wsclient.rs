@@ -1187,6 +1187,111 @@ where
     Ok(bytes)
 }
 
+/// Default total attempts (first try included) for one clone/fetch GET
+/// of a manifest, chunk or single pack. See [`retry_transient_get`].
+pub const DEFAULT_FETCH_GET_ATTEMPTS: u32 = 3;
+
+/// Env var overriding [`DEFAULT_FETCH_GET_ATTEMPTS`].
+pub const FETCH_GET_ATTEMPTS_ENV: &str = "FREENET_GIT_CHUNK_RETRIES";
+
+/// Pure parser for [`FETCH_GET_ATTEMPTS_ENV`]. `None` is the default;
+/// anything that is not a positive integer is an `Err` describing why
+/// (the caller warns and falls back to the default).
+fn parse_fetch_get_attempts(value: Option<&str>) -> Result<u32, String> {
+    match value {
+        None => Ok(DEFAULT_FETCH_GET_ATTEMPTS),
+        Some(s) => match s.trim().parse::<u32>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(format!(
+                "{FETCH_GET_ATTEMPTS_ENV}={s:?} is not a positive integer"
+            )),
+        },
+    }
+}
+
+/// Total GET attempts (first try included) for clone/fetch from
+/// [`FETCH_GET_ATTEMPTS_ENV`]. `1` disables retry. An invalid value
+/// prints a warning and falls back to [`DEFAULT_FETCH_GET_ATTEMPTS`].
+pub fn fetch_get_attempts_from_env() -> u32 {
+    let raw = std::env::var(FETCH_GET_ATTEMPTS_ENV).ok();
+    match parse_fetch_get_attempts(raw.as_deref()) {
+        Ok(n) => n,
+        Err(msg) => {
+            eprintln!("warning: {msg}; using default of {DEFAULT_FETCH_GET_ATTEMPTS} attempts");
+            DEFAULT_FETCH_GET_ATTEMPTS
+        }
+    }
+}
+
+/// Run one clone/fetch GET up to `attempts` times, retrying only
+/// transient failures: a per-op GET timeout or host backpressure, as
+/// classified by [`ProbeOutcome::retry_disposition`] (the same
+/// classification the repo-state probe uses). NOT retried: an
+/// authoritative `NotFound` (same convention as the probe: it is a
+/// definitive answer for this key), a content-hash mismatch, and any
+/// other error (dead connection, send failure).
+///
+/// Stale-response safety: the retry reuses the same connection and the
+/// same key. A late response to the timed-out attempt can therefore
+/// satisfy the retry, which is fine because it carries the same key's
+/// content and the caller BLAKE3-verifies it. A late response for any
+/// OTHER key is skipped by `dispatch_get_response`'s key matching, so
+/// no reconnect is needed. (A surplus duplicate left in the queue is
+/// likewise skipped by every later GET for a different key.)
+///
+/// `fetch` should take any connection lock per call, not across calls,
+/// so the backoff sleep does not block sibling chunks sharing the
+/// connection. Prints one stderr line per retry.
+pub async fn retry_transient_get<T, F>(attempts: u32, label: &str, fetch: F) -> Result<T>
+where
+    F: AsyncFnMut() -> Result<T>,
+{
+    retry_transient_get_with(attempts, label, fetch, tokio::time::sleep).await
+}
+
+/// [`retry_transient_get`] with an injectable sleeper for tests.
+pub(crate) async fn retry_transient_get_with<T, F, S, SFut>(
+    attempts: u32,
+    label: &str,
+    mut fetch: F,
+    mut sleep: S,
+) -> Result<T>
+where
+    F: AsyncFnMut() -> Result<T>,
+    S: FnMut(Duration) -> SFut,
+    SFut: std::future::Future<Output = ()>,
+{
+    let attempts = attempts.max(1);
+    let mut attempt = 1u32;
+    loop {
+        let err = match fetch().await {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        let outcome = ProbeOutcome::from_get_state_err(&err);
+        let transient = outcome.retry_disposition() == RetryDisposition::Transient;
+        if !transient || attempt >= attempts {
+            if attempt > 1 {
+                return Err(err.context(format!(
+                    "{label}: giving up after {attempt} of {attempts} attempts"
+                )));
+            }
+            return Err(err);
+        }
+        let what = if matches!(outcome, ProbeOutcome::Timeout) {
+            "GET timed out"
+        } else {
+            "host busy"
+        };
+        eprintln!(
+            "{label}: {what}, retrying (attempt {}/{attempts})",
+            attempt + 1
+        );
+        sleep(retry_backoff(attempt)).await;
+        attempt += 1;
+    }
+}
+
 fn hex_lower(b: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut s = String::with_capacity(b.len() * 2);
@@ -2075,5 +2180,139 @@ mod tests {
             retry_backoff(u32::MAX),
             Duration::from_secs(MAX_BACKOFF_SECS)
         );
+    }
+
+    // ---- clone/fetch GET retry (#36) ----
+
+    fn timeout_err() -> anyhow::Error {
+        anyhow!("{GET_TIMEOUT_PREFIX} after {:?}", Duration::from_secs(180))
+    }
+
+    /// Run the retry loop with a recording sleeper; returns
+    /// (result, fetch call count, sleeps requested).
+    async fn run_retry(
+        attempts: u32,
+        mut outcomes: Vec<Result<Vec<u8>>>,
+    ) -> (Result<Vec<u8>>, u32, Vec<Duration>) {
+        outcomes.reverse();
+        let mut calls = 0u32;
+        let sleeps = std::sync::Mutex::new(Vec::new());
+        let res = retry_transient_get_with(
+            attempts,
+            "chunk 2/3",
+            async || {
+                calls += 1;
+                outcomes
+                    .pop()
+                    .expect("fetcher called more often than scripted")
+            },
+            |d| {
+                sleeps.lock().unwrap().push(d);
+                async {}
+            },
+        )
+        .await;
+        (res, calls, sleeps.into_inner().unwrap())
+    }
+
+    #[tokio::test]
+    async fn retry_get_succeeds_after_one_timeout() {
+        let (res, calls, sleeps) = run_retry(3, vec![Err(timeout_err()), Ok(vec![1, 2, 3])]).await;
+        assert_eq!(res.unwrap(), vec![1, 2, 3]);
+        assert_eq!(calls, 2, "fetcher must be called twice");
+        assert_eq!(sleeps, vec![retry_backoff(1)]);
+    }
+
+    #[tokio::test]
+    async fn retry_get_retries_host_backpressure() {
+        let (res, calls, _) = run_retry(
+            3,
+            vec![
+                Err(anyhow!("recv: contract queue full, try again later")),
+                Ok(vec![9]),
+            ],
+        )
+        .await;
+        assert_eq!(res.unwrap(), vec![9]);
+        assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
+    async fn retry_get_gives_up_after_n_attempts_keeping_timeout_text() {
+        let (res, calls, sleeps) = run_retry(
+            3,
+            vec![Err(timeout_err()), Err(timeout_err()), Err(timeout_err())],
+        )
+        .await;
+        assert_eq!(calls, 3);
+        assert_eq!(sleeps.len(), 2, "no sleep after the final attempt");
+        let msg = format!("{:#}", res.unwrap_err());
+        assert!(msg.contains("3 attempts"), "got: {msg}");
+        assert!(msg.contains("chunk 2/3"), "got: {msg}");
+        assert!(msg.contains(GET_TIMEOUT_PREFIX), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn retry_get_does_not_retry_hash_mismatch_or_hard_errors() {
+        for e in [
+            anyhow!("pack content hash mismatch: got aa expected bb"),
+            anyhow!("recv: connection closed"),
+        ] {
+            let text = e.to_string();
+            let (res, calls, sleeps) = run_retry(3, vec![Err(e)]).await;
+            assert_eq!(calls, 1, "must not retry: {text}");
+            assert!(sleeps.is_empty());
+            assert!(res.unwrap_err().to_string().contains(&text));
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_get_does_not_retry_authoritative_not_found() {
+        let (res, calls, _) =
+            run_retry(3, vec![Err(anyhow!("contract abc {GET_NOT_FOUND_SUFFIX}"))]).await;
+        assert_eq!(calls, 1);
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn retry_get_one_attempt_means_no_retry_and_unwrapped_error() {
+        let (res, calls, sleeps) = run_retry(1, vec![Err(timeout_err())]).await;
+        assert_eq!(calls, 1);
+        assert!(sleeps.is_empty());
+        assert_eq!(
+            res.unwrap_err().to_string(),
+            timeout_err().to_string(),
+            "attempts=1 must surface the original error untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_get_total_backoff_is_bounded() {
+        let n = 50;
+        let outcomes = (0..n).map(|_| Err(timeout_err())).collect();
+        let (_, calls, sleeps) = run_retry(n, outcomes).await;
+        assert_eq!(calls, n);
+        assert_eq!(sleeps.len(), (n - 1) as usize);
+        assert!(sleeps
+            .iter()
+            .all(|d| *d <= Duration::from_secs(MAX_BACKOFF_SECS)));
+        let total: Duration = sleeps.iter().sum();
+        assert!(total <= Duration::from_secs(MAX_BACKOFF_SECS * (n as u64 - 1)));
+        // The default 3 attempts sleep only 2s + 4s.
+        let (_, _, s3) = run_retry(3, (0..3).map(|_| Err(timeout_err())).collect()).await;
+        assert_eq!(s3.iter().sum::<Duration>(), Duration::from_secs(6));
+    }
+
+    #[test]
+    fn parse_fetch_get_attempts_handles_all_inputs() {
+        assert_eq!(
+            parse_fetch_get_attempts(None),
+            Ok(DEFAULT_FETCH_GET_ATTEMPTS)
+        );
+        assert_eq!(parse_fetch_get_attempts(Some("1")), Ok(1));
+        assert_eq!(parse_fetch_get_attempts(Some("5")), Ok(5));
+        for bad in ["0", "", "abc", "-1", "2.5"] {
+            assert!(parse_fetch_get_attempts(Some(bad)).is_err(), "{bad:?}");
+        }
     }
 }
