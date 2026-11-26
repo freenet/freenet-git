@@ -692,21 +692,25 @@ async fn converge_fetch<I: BundleInstaller>(
                     wanted_commits.extend(new_wants);
                 }
                 NextDownload::DownloadRemaining(ids) => {
-                    // Install ONE bundle (first in sorted order) and
-                    // re-walk, so we stop as soon as the missing parent
-                    // appears instead of downloading every dead-weight
-                    // bundle. Terminates: each pass grows `downloaded`.
+                    // Install ALL remaining bundles (sorted), not one at
+                    // a time. Finding every missing commit does not mean
+                    // every tree and blob is present: after a force push
+                    // the new pack omits objects reachable from the old
+                    // ref (e.g. a blob reused from the abandoned
+                    // history), and those can live in an abandoned
+                    // bundle that no missing commit points at.
                     eprintln!(
                         "    {} needed commit(s) are not tipped by any bundle; \
-                         trying {} remaining bundle(s) one at a time (history was likely rewritten by a force push)",
+                         downloading {} remaining bundle(s) (history was likely rewritten by a force push)",
                         new_wants.len(),
                         ids.len(),
                     );
-                    let id = ids[0];
-                    let label = format!("bundle {step}");
-                    installer.install(&id, &label).await?;
-                    downloaded.insert(id);
-                    *step += 1;
+                    for id in &ids {
+                        let label = format!("bundle {step}");
+                        installer.install(id, &label).await?;
+                        downloaded.insert(*id);
+                        *step += 1;
+                    }
                     wanted_commits.extend(new_wants);
                 }
                 NextDownload::Stuck => {
@@ -3167,6 +3171,18 @@ mod tests {
     /// Pack exactly the objects reachable from `include` but not from
     /// any of `exclude`, as a real incremental push does.
     fn pack_range(repo: &std::path::Path, include: &str, exclude: &[&str]) -> Vec<u8> {
+        pack_range_omitting(repo, include, exclude, &[])
+    }
+
+    /// Like [`pack_range`] but leaves the listed object ids out of the
+    /// pack, as a pack built with exclusions can omit objects the
+    /// receiver is assumed to hold.
+    fn pack_range_omitting(
+        repo: &std::path::Path,
+        include: &str,
+        exclude: &[&str],
+        omit: &[&str],
+    ) -> Vec<u8> {
         let mut args = vec![
             "rev-list".to_string(),
             "--objects".to_string(),
@@ -3186,7 +3202,18 @@ mod tests {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(&list.stdout).unwrap();
+        let keep: String = String::from_utf8(list.stdout)
+            .unwrap()
+            .lines()
+            .filter(|l| !omit.iter().any(|o| l.starts_with(o)))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(keep.as_bytes())
+            .unwrap();
         let out = child.wait_with_output().unwrap();
         assert!(out.status.success());
         out.stdout
@@ -3496,10 +3523,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn converge_fetch_fallback_stops_once_history_is_complete() {
-        // C1 lives in B9, which sorts AFTER the unrelated abandoned
-        // bundles B3 and B4; B10 sorts after B9 and must never be
-        // installed.
+    async fn converge_fetch_fallback_installs_every_remaining_bundle() {
+        // C1 lives in B9, which sorts after the unrelated abandoned
+        // bundles B3 and B4. Every remaining bundle is installed, B10
+        // included, since abandoned bundles may hold other needed objects.
         let fx = force_push_fixture();
         let (z3, p3) = unrelated_bundle("z3");
         let (z4, p4) = unrelated_bundle("z4");
@@ -3537,8 +3564,7 @@ mod tests {
         .await
         .unwrap();
         assert!(has_commit(&git_dir, &fx.c1));
-        assert_eq!(installer.installed, vec![b2, b3, b4, b9]);
-        assert!(!downloaded.contains(&b10), "B10 must never be installed");
+        assert_eq!(installer.installed, vec![b2, b3, b4, b9, b10]);
     }
 
     #[tokio::test]
@@ -3669,5 +3695,72 @@ mod tests {
         assert!(has_commit(&git_dir, &fx.c4));
         assert!(has_commit(&git_dir, &fx.c1));
         assert_eq!(installer.installed, vec![bt]);
+    }
+
+    #[tokio::test]
+    async fn converge_fetch_fallback_fetches_blob_reused_from_abandoned_bundle() {
+        // A = C0..C1. B = C2..C3, adding blob X. Force push: C4 (parent
+        // C0) reuses X, so its pack (C4 ^C3) omits X. A sorts before B.
+        // Finding every commit does not mean every blob is present.
+        let src = tempfile::tempdir().unwrap();
+        let c0 = commit_in(src.path(), "c0", "a.txt", "0\n", &[]).unwrap();
+        let c1 = commit_in(src.path(), "c1", "a.txt", "1\n", &[]).unwrap();
+        let pack_a = pack_range(src.path(), &c1, &[]);
+        let _c2 = commit_in(src.path(), "c2", "x.txt", "shared blob X\n", &[]).unwrap();
+        let c3 = commit_in(src.path(), "c3", "a.txt", "3\n", &[]).unwrap();
+        let pack_b = pack_range(src.path(), &c3, &[&c1]);
+        let x = String::from_utf8(
+            Command::new("git")
+                .current_dir(src.path())
+                .args(["rev-parse", &format!("{c3}:x.txt")])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        git_in(src.path(), &["reset", "--hard", "-q", &c0]);
+        let c4 = commit_in(src.path(), "c4", "x.txt", "shared blob X\n", &[]).unwrap();
+        // `rev-list --objects C4 ^C3` as run today still lists X, but a
+        // pack built with exclusions may omit it. Omit it here.
+        let pack_f = pack_range_omitting(src.path(), &c4, &[&c3], &[&x]);
+
+        let (a, b, f) = (id_of(1), id_of(2), id_of(3));
+        let tips = std::collections::HashMap::from([
+            (parse_hex_commit(&c1), a),
+            (parse_hex_commit(&c3), b),
+            (parse_hex_commit(&c4), f),
+        ]);
+        let (_client, git_dir) = fresh_client();
+        let mut installer = installer_with(&git_dir, vec![(a, pack_a), (b, pack_b), (f, pack_f)]);
+        let mut downloaded = std::collections::HashSet::new();
+        let mut step = 1usize;
+        run_converge(
+            &git_dir,
+            &tips,
+            &[a, b, f],
+            std::iter::once(parse_hex_commit(&c4)).collect(),
+            &mut downloaded,
+            &mut step,
+            &mut installer,
+        )
+        .await
+        .unwrap();
+        let st = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["cat-file", "-e", &x])
+            .status()
+            .unwrap();
+        assert!(st.success(), "blob X must be present");
+        let st = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["rev-list", "--objects", &c4])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "every object reachable from C4 must exist");
     }
 }
