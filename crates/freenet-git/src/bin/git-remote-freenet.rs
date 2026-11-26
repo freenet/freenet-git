@@ -694,9 +694,9 @@ async fn converge_fetch<I: BundleInstaller>(
                 NextDownload::DownloadRemaining(ids) => {
                     // Install ALL remaining bundles (sorted), not one at
                     // a time. Finding every missing commit does not mean
-                    // every tree and blob is present: after a force push
-                    // the new pack omits objects reachable from the old
-                    // ref (e.g. a blob reused from the abandoned
+                    // every tree and blob is present: a pack built
+                    // against the old ref can omit objects reachable
+                    // from it (e.g. a blob reused from the abandoned
                     // history), and those can live in an abandoned
                     // bundle that no missing commit points at.
                     eprintln!(
