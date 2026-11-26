@@ -370,11 +370,15 @@ where
     .await?;
     let actual_parallelism = conns.len();
 
+    let attempts = wsclient::fetch_get_attempts_from_env();
     let manifest_bytes = {
-        let mut conn = conns[0].lock().await;
-        wsclient::get_pack(&mut conn, pack_wasm, manifest_hash, timeout_per_op)
-            .await
-            .context("GET manifest")?
+        let conn = conns[0].clone();
+        wsclient::retry_transient_get(attempts, "manifest", async || {
+            let mut conn = conn.lock().await;
+            wsclient::get_pack(&mut conn, pack_wasm, manifest_hash, timeout_per_op).await
+        })
+        .await
+        .context("GET manifest")?
     };
 
     // Phase 2: decode and re-validate.
@@ -411,11 +415,20 @@ where
             let pack_wasm = pack_wasm.clone();
             let expected_len = chunk_lens[i];
             async move {
-                let mut conn = conn.lock().await;
-                let chunk =
-                    wsclient::get_pack(&mut conn, &pack_wasm, expected_hash, timeout_per_op)
-                        .await
-                        .with_context(|| format!("GET chunk {i}"))?;
+                // Lock per attempt, not across the retry loop, so a
+                // backoff sleep does not stall sibling chunks that
+                // share this connection.
+                let chunk = wsclient::retry_transient_get(
+                    attempts,
+                    &format!("chunk {}/{n}", i + 1),
+                    async || {
+                        let mut conn = conn.lock().await;
+                        wsclient::get_pack(&mut conn, &pack_wasm, expected_hash, timeout_per_op)
+                            .await
+                    },
+                )
+                .await
+                .with_context(|| format!("GET chunk {i}"))?;
                 if (chunk.len() as u64) != expected_len {
                     bail!(
                         "chunk {i} length {} disagrees with manifest expectation {}",

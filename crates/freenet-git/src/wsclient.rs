@@ -1194,29 +1194,102 @@ pub const DEFAULT_FETCH_GET_ATTEMPTS: u32 = 3;
 /// Env var overriding [`DEFAULT_FETCH_GET_ATTEMPTS`].
 pub const FETCH_GET_ATTEMPTS_ENV: &str = "FREENET_GIT_CHUNK_RETRIES";
 
-/// Pure parser for [`FETCH_GET_ATTEMPTS_ENV`].
-fn parse_fetch_get_attempts(_value: Option<&str>) -> Result<u32, String> {
-    Ok(1)
+/// Pure parser for [`FETCH_GET_ATTEMPTS_ENV`]. `None` is the default;
+/// anything that is not a positive integer is an `Err` describing why
+/// (the caller warns and falls back to the default).
+fn parse_fetch_get_attempts(value: Option<&str>) -> Result<u32, String> {
+    match value {
+        None => Ok(DEFAULT_FETCH_GET_ATTEMPTS),
+        Some(s) => match s.trim().parse::<u32>() {
+            Ok(n) if n > 0 => Ok(n),
+            _ => Err(format!(
+                "{FETCH_GET_ATTEMPTS_ENV}={s:?} is not a positive integer"
+            )),
+        },
+    }
 }
 
-/// Total GET attempts from the environment.
+/// Total GET attempts (first try included) for clone/fetch from
+/// [`FETCH_GET_ATTEMPTS_ENV`]. `1` disables retry. An invalid value
+/// prints a warning and falls back to [`DEFAULT_FETCH_GET_ATTEMPTS`].
 pub fn fetch_get_attempts_from_env() -> u32 {
-    DEFAULT_FETCH_GET_ATTEMPTS
+    let raw = std::env::var(FETCH_GET_ATTEMPTS_ENV).ok();
+    match parse_fetch_get_attempts(raw.as_deref()) {
+        Ok(n) => n,
+        Err(msg) => {
+            eprintln!("warning: {msg}; using default of {DEFAULT_FETCH_GET_ATTEMPTS} attempts");
+            DEFAULT_FETCH_GET_ATTEMPTS
+        }
+    }
 }
 
-/// Retry wrapper for clone/fetch GETs.
+/// Run one clone/fetch GET up to `attempts` times, retrying only
+/// transient failures: a per-op GET timeout or host backpressure, as
+/// classified by [`ProbeOutcome::retry_disposition`] (the same
+/// classification the repo-state probe uses). NOT retried: an
+/// authoritative `NotFound` (same convention as the probe: it is a
+/// definitive answer for this key), a content-hash mismatch, and any
+/// other error (dead connection, send failure).
+///
+/// Stale-response safety: the retry reuses the same connection and the
+/// same key. A late response to the timed-out attempt can therefore
+/// satisfy the retry, which is fine because it carries the same key's
+/// content and the caller BLAKE3-verifies it. A late response for any
+/// OTHER key is skipped by `dispatch_get_response`'s key matching, so
+/// no reconnect is needed. (A surplus duplicate left in the queue is
+/// likewise skipped by every later GET for a different key.)
+///
+/// `fetch` should take any connection lock per call, not across calls,
+/// so the backoff sleep does not block sibling chunks sharing the
+/// connection. Prints one stderr line per retry.
+pub async fn retry_transient_get<T, F>(attempts: u32, label: &str, fetch: F) -> Result<T>
+where
+    F: AsyncFnMut() -> Result<T>,
+{
+    retry_transient_get_with(attempts, label, fetch, tokio::time::sleep).await
+}
+
+/// [`retry_transient_get`] with an injectable sleeper for tests.
 pub(crate) async fn retry_transient_get_with<T, F, S, SFut>(
-    _attempts: u32,
-    _label: &str,
+    attempts: u32,
+    label: &str,
     mut fetch: F,
-    _sleep: S,
+    mut sleep: S,
 ) -> Result<T>
 where
     F: AsyncFnMut() -> Result<T>,
     S: FnMut(Duration) -> SFut,
     SFut: std::future::Future<Output = ()>,
 {
-    fetch().await
+    let attempts = attempts.max(1);
+    let mut attempt = 1u32;
+    loop {
+        let err = match fetch().await {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        let outcome = ProbeOutcome::from_get_state_err(&err);
+        let transient = outcome.retry_disposition() == RetryDisposition::Transient;
+        if !transient || attempt >= attempts {
+            if attempt > 1 {
+                return Err(err.context(format!(
+                    "{label}: giving up after {attempt} of {attempts} attempts"
+                )));
+            }
+            return Err(err);
+        }
+        let what = if matches!(outcome, ProbeOutcome::Timeout) {
+            "GET timed out"
+        } else {
+            "host busy"
+        };
+        eprintln!(
+            "{label}: {what}, retrying (attempt {}/{attempts})",
+            attempt + 1
+        );
+        sleep(retry_backoff(attempt)).await;
+        attempt += 1;
+    }
 }
 
 fn hex_lower(b: &[u8]) -> String {

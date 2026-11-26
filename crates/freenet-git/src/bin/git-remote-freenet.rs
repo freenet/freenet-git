@@ -685,7 +685,12 @@ async fn download_bundle(
                 "    [{label}] downloading pack ({})",
                 human_bytes(*size_bytes),
             );
-            let bytes = wsclient::get_pack(api, pack_wasm, *pack_hash, ws_timeout()).await?;
+            let bytes = wsclient::retry_transient_get(
+                wsclient::fetch_get_attempts_from_env(),
+                "pack",
+                async || wsclient::get_pack(api, pack_wasm, *pack_hash, ws_timeout()).await,
+            )
+            .await?;
             Ok(bytes)
         }
         ObjectBundle::ChunkedPack {
