@@ -466,6 +466,12 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
         //      aren't in the local objects yet). Add those parents to
         //      `wanted_commits`.
         //    - Repeat until no new bundles need downloading.
+        //    - Fallback (#86): if parents are still unresolved and NONE
+        //      is the tip of an undownloaded bundle, download every
+        //      remaining bundle in the object_index (see
+        //      `plan_unresolved_downloads`) and re-walk. Only if
+        //      parents are still missing after all bundles are
+        //      downloaded does the fetch fail.
         //
         // For snapshot mode (orphan tip with no parents): one tipped
         // bundle, parents walk is empty, done.
@@ -478,8 +484,13 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
         // downloaded -- no missing ancestors.
         //
         // Bundles whose tips don't appear on any wanted-commit history
-        // path (e.g. orphan force-push remnants) are correctly
-        // skipped.
+        // path are skipped as long as the history is complete without
+        // them (snapshot mode: an orphan tip has no parents, so the
+        // fallback is never reached). After a history-rewriting force
+        // push the new bundle holds only the new commits, and its
+        // parent lives inside an older bundle whose tip is an abandoned
+        // commit. No tip matches that parent, so the fallback above
+        // downloads the remaining bundles to find it.
         let bundle_tips = collect_bundle_tip_extensions(&state);
         let tip_to_bundle: std::collections::HashMap<CommitHash, freenet_git_types::ObjectBundleId> =
             bundle_tips.iter().map(|(b, t)| (*t, *b)).collect();
@@ -571,8 +582,7 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
 /// Downloads and installs one bundle from the object_index. A trait so
 /// [`converge_fetch`] can be driven in tests without a gateway.
 trait BundleInstaller {
-    async fn install(&mut self, id: &freenet_git_types::ObjectBundleId, label: &str)
-        -> Result<()>;
+    async fn install(&mut self, id: &freenet_git_types::ObjectBundleId, label: &str) -> Result<()>;
 }
 
 struct GatewayInstaller<'a> {
@@ -583,11 +593,7 @@ struct GatewayInstaller<'a> {
 }
 
 impl BundleInstaller for GatewayInstaller<'_> {
-    async fn install(
-        &mut self,
-        id: &freenet_git_types::ObjectBundleId,
-        label: &str,
-    ) -> Result<()> {
+    async fn install(&mut self, id: &freenet_git_types::ObjectBundleId, label: &str) -> Result<()> {
         let record = self
             .state
             .object_index
@@ -605,13 +611,61 @@ impl BundleInstaller for GatewayInstaller<'_> {
     }
 }
 
+/// What `converge_fetch` should do when commits are still missing
+/// locally and no wanted commit has an undownloaded tipped bundle.
+#[derive(Debug, PartialEq, Eq)]
+enum NextDownload {
+    /// Some missing commit is the tip of a bundle not yet downloaded.
+    DownloadTipped(Vec<freenet_git_types::ObjectBundleId>),
+    /// No missing commit is a bundle tip, but bundles remain that we
+    /// skipped. After a history-rewriting force push the needed parent
+    /// sits inside an older bundle whose tip is an abandoned commit, so
+    /// no tip matches it (#86). Download everything left.
+    DownloadRemaining(Vec<freenet_git_types::ObjectBundleId>),
+    /// Every bundle in the object_index is already downloaded and
+    /// commits are still missing: genuinely absent.
+    Stuck,
+}
+
+/// Pure decision for the "unresolved parents" step of `converge_fetch`.
+/// Ids are sorted so the order is deterministic.
+fn plan_unresolved_downloads(
+    tip_to_bundle: &std::collections::HashMap<CommitHash, freenet_git_types::ObjectBundleId>,
+    all_ids: &[freenet_git_types::ObjectBundleId],
+    downloaded: &std::collections::HashSet<freenet_git_types::ObjectBundleId>,
+    new_wants: &std::collections::HashSet<CommitHash>,
+) -> NextDownload {
+    let mut tipped: Vec<_> = new_wants
+        .iter()
+        .filter_map(|c| tip_to_bundle.get(c))
+        .copied()
+        .filter(|id| !downloaded.contains(id))
+        .collect();
+    if !tipped.is_empty() {
+        tipped.sort_unstable();
+        tipped.dedup();
+        return NextDownload::DownloadTipped(tipped);
+    }
+    let mut remaining: Vec<_> = all_ids
+        .iter()
+        .copied()
+        .filter(|id| !downloaded.contains(id))
+        .collect();
+    if remaining.is_empty() {
+        return NextDownload::Stuck;
+    }
+    remaining.sort_unstable();
+    remaining.dedup();
+    NextDownload::DownloadRemaining(remaining)
+}
+
 /// Phase 2 of fetch: iteratively download tipped bundles until every
 /// wanted commit's history is present locally. See the algorithm
 /// comment in [`handle_fetch`].
 async fn converge_fetch<I: BundleInstaller>(
     git_dir: &std::path::Path,
     tip_to_bundle: &std::collections::HashMap<CommitHash, freenet_git_types::ObjectBundleId>,
-    _all_ids: &[freenet_git_types::ObjectBundleId],
+    all_ids: &[freenet_git_types::ObjectBundleId],
     mut wanted_commits: std::collections::HashSet<CommitHash>,
     downloaded: &mut std::collections::HashSet<freenet_git_types::ObjectBundleId>,
     step: &mut usize,
@@ -632,18 +686,37 @@ async fn converge_fetch<I: BundleInstaller>(
             if new_wants.is_empty() {
                 return Ok(());
             }
-            let any_resolvable = new_wants.iter().any(|c| tip_to_bundle.contains_key(c));
-            if !any_resolvable {
-                let sample: Vec<_> = new_wants.iter().take(3).map(hex_encode_commit).collect();
-                bail!(
-                    "fetch could not converge: {} commit(s) needed but no bundle in object_index advertises them. \
-                     First missing: {}. The contract state may be inconsistent (missing bundles) \
-                     or pre-0.1.16 bundles whose objects don't include the wanted history.",
-                    new_wants.len(),
-                    sample.join(", "),
-                );
+            match plan_unresolved_downloads(tip_to_bundle, all_ids, downloaded, &new_wants) {
+                NextDownload::DownloadTipped(_) => {
+                    // The next iteration downloads the tipped bundles.
+                    wanted_commits.extend(new_wants);
+                }
+                NextDownload::DownloadRemaining(ids) => {
+                    eprintln!(
+                        "    {} needed commit(s) are not tipped by any bundle; \
+                         downloading {} remaining bundle(s) (history was likely rewritten by a force push)",
+                        new_wants.len(),
+                        ids.len(),
+                    );
+                    for id in &ids {
+                        let label = format!("bundle {step}");
+                        installer.install(id, &label).await?;
+                        downloaded.insert(*id);
+                        *step += 1;
+                    }
+                    wanted_commits.extend(new_wants);
+                }
+                NextDownload::Stuck => {
+                    let sample: Vec<_> = new_wants.iter().take(3).map(hex_encode_commit).collect();
+                    bail!(
+                        "fetch could not converge: {} commit(s) needed but no bundle in object_index advertises them. \
+                         First missing: {}. The contract state may be inconsistent (missing bundles) \
+                         or pre-0.1.16 bundles whose objects don't include the wanted history.",
+                        new_wants.len(),
+                        sample.join(", "),
+                    );
+                }
             }
-            wanted_commits.extend(new_wants);
             continue;
         }
 
@@ -3286,6 +3359,85 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(installer.installed, vec![B1], "dead-weight B2 stays skipped");
+        assert_eq!(
+            installer.installed,
+            vec![B1],
+            "dead-weight B2 stays skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn converge_fetch_downloads_everything_then_errors_when_parent_still_missing() {
+        // B3 is an unrelated bundle that does not contain C1. The
+        // fallback downloads it, C1 is still missing, and the fetch
+        // fails instead of looping.
+        let fx = force_push_fixture();
+        let other = tempfile::tempdir().unwrap();
+        let other_shas = [commit_in(other.path(), "unrelated", "z.txt", "zzz\n", &[]).unwrap()];
+        let b3_pack = pack_range(other.path(), &other_shas[0], &[]);
+        const B3: freenet_git_types::ObjectBundleId = [3u8; 32];
+        let (_client, git_dir) = fresh_client();
+        let tip_to_bundle = std::collections::HashMap::from([
+            (parse_hex_commit(&fx.c4), B2),
+            (parse_hex_commit(&other_shas[0]), B3),
+        ]);
+        let mut installer = FakeInstaller {
+            git_dir: git_dir.clone(),
+            packs: std::collections::HashMap::from([(B2, fx.b2_pack.clone()), (B3, b3_pack)]),
+            installed: vec![],
+        };
+        let mut downloaded = std::collections::HashSet::new();
+        let mut step = 1usize;
+        let err = converge_fetch(
+            &git_dir,
+            &tip_to_bundle,
+            &[B2, B3],
+            std::iter::once(parse_hex_commit(&fx.c4)).collect(),
+            &mut downloaded,
+            &mut step,
+            &mut installer,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("fetch could not converge"),
+            "{err}"
+        );
+        assert_eq!(installer.installed, vec![B2, B3]);
+    }
+
+    #[test]
+    fn plan_unresolved_downloads_decisions() {
+        let c_a = [0xaa; 20];
+        let c_b = [0xbb; 20];
+        let tips = std::collections::HashMap::from([(c_a, B1), (c_b, B2)]);
+        let all = [B1, B2];
+        let none = std::collections::HashSet::new();
+        let wants =
+            |cs: &[CommitHash]| cs.iter().copied().collect::<std::collections::HashSet<_>>();
+
+        // A missing commit that is a bundle tip: tipped download.
+        assert_eq!(
+            plan_unresolved_downloads(&tips, &all, &none, &wants(&[c_a])),
+            NextDownload::DownloadTipped(vec![B1])
+        );
+        // Tipped bundle already downloaded and nothing else tipped: fall
+        // back to what remains.
+        let have_b1 = std::collections::HashSet::from([B1]);
+        assert_eq!(
+            plan_unresolved_downloads(&tips, &all, &have_b1, &wants(&[c_a])),
+            NextDownload::DownloadRemaining(vec![B2])
+        );
+        // Missing commit with no tip mapping: fallback downloads all.
+        assert_eq!(
+            plan_unresolved_downloads(&tips, &all, &none, &wants(&[[0xcc; 20]])),
+            NextDownload::DownloadRemaining(vec![B1, B2])
+        );
+        // Everything downloaded, still missing: stuck.
+        let have_all = std::collections::HashSet::from([B1, B2]);
+        assert_eq!(
+            plan_unresolved_downloads(&tips, &all, &have_all, &wants(&[[0xcc; 20]])),
+            NextDownload::Stuck
+        );
     }
 }
