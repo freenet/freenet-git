@@ -42,5 +42,5 @@ a397cc99e79f99e2d320a24b0d4db5f6ab36d1f35e8454c87bf996e249ad9c13  crates/freenet
 4140e677d7715f74805d958a47c52ec13b174dcda77ccfb6fa30204f257a0a87  crates/freenet-git/contracts/pack-contract.wasm
 
 # --- what the sources compile to now: drift detector, ships nothing ---
-303cd2a6f8e23adf680dc11d74a56b12a8248d4df57f30a4bc997c201beb43c4  target/wasm32-unknown-unknown/release/freenet_git_repo_contract.wasm
+1937892f1dc07627f6e24e0a1c09b0d9f4e3be144f6123ab182c85b47a8bc578  target/wasm32-unknown-unknown/release/freenet_git_repo_contract.wasm
 188cb7d49354f5b4ad89052ccc71d97e1484ce44821eb0b16f19031c3a1e9a89  target/wasm32-unknown-unknown/release/freenet_git_pack_contract.wasm
