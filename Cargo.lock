@@ -619,7 +619,7 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "freenet-git"
-version = "0.1.27"
+version = "0.1.28"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-git-encoding"
-version = "0.1.27"
+version = "0.1.28"
 dependencies = [
  "blake3",
  "ed25519-dalek",
@@ -662,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-git-identity"
-version = "0.1.27"
+version = "0.1.28"
 dependencies = [
  "bincode",
  "blake3",
@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-git-pack-contract"
-version = "0.1.27"
+version = "0.1.28"
 dependencies = [
  "blake3",
  "freenet-stdlib",
@@ -689,7 +689,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-git-repo-contract"
-version = "0.1.27"
+version = "0.1.28"
 dependencies = [
  "bincode",
  "ed25519-dalek",
@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "freenet-git-types"
-version = "0.1.27"
+version = "0.1.28"
 dependencies = [
  "bincode",
  "blake3",
