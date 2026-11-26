@@ -466,6 +466,12 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
         //      aren't in the local objects yet). Add those parents to
         //      `wanted_commits`.
         //    - Repeat until no new bundles need downloading.
+        //    - Fallback (#86): if parents are still unresolved and NONE
+        //      is the tip of an undownloaded bundle, download every
+        //      remaining bundle in the object_index (see
+        //      `plan_unresolved_downloads`) and re-walk. Only if
+        //      parents are still missing after all bundles are
+        //      downloaded does the fetch fail.
         //
         // For snapshot mode (orphan tip with no parents): one tipped
         // bundle, parents walk is empty, done.
@@ -478,8 +484,13 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
         // downloaded -- no missing ancestors.
         //
         // Bundles whose tips don't appear on any wanted-commit history
-        // path (e.g. orphan force-push remnants) are correctly
-        // skipped.
+        // path are skipped as long as the history is complete without
+        // them (snapshot mode: an orphan tip has no parents, so the
+        // fallback is never reached). After a history-rewriting force
+        // push the new bundle holds only the new commits, and its
+        // parent lives inside an older bundle whose tip is an abandoned
+        // commit. No tip matches that parent, so the fallback above
+        // downloads the remaining bundles to find it.
         let bundle_tips = collect_bundle_tip_extensions(&state);
         let tip_to_bundle: std::collections::HashMap<CommitHash, freenet_git_types::ObjectBundleId> =
             bundle_tips.iter().map(|(b, t)| (*t, *b)).collect();
@@ -532,70 +543,23 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
         if wanted_commits.is_empty() {
             wanted_commits = state.refs.values().map(|e| e.target).collect();
         }
-        let mut walked: std::collections::HashSet<CommitHash> =
-            std::collections::HashSet::new();
-
-        loop {
-            let to_download: Vec<_> = wanted_commits
-                .iter()
-                .filter_map(|c| tip_to_bundle.get(c))
-                .copied()
-                .filter(|id| !downloaded.contains(id))
-                .collect();
-
-            if to_download.is_empty() {
-                // Even after all tipped bundles for current wanted set
-                // are loaded, we may still have unresolved parents in
-                // the commit graph. Walk them and check if any ARE
-                // tipped on bundles we haven't yet downloaded.
-                let new_wants =
-                    walk_unresolved_parents(&env.git_dir, &wanted_commits, &mut walked)?;
-                if new_wants.is_empty() {
-                    break;
-                }
-                // Stuck-detection: if every unresolved commit lacks a
-                // bundle-tip mapping, the next iteration would also
-                // produce empty `to_download` and re-walk to the same
-                // unresolved set forever. Bail with a directed error
-                // pointing at the missing commits. This catches
-                // contract states with malformed bundle-tip values,
-                // missing legacy bundles, or any other inconsistency
-                // where the wanted history simply isn't in any
-                // available bundle.
-                let any_resolvable =
-                    new_wants.iter().any(|c| tip_to_bundle.contains_key(c));
-                if !any_resolvable {
-                    let sample: Vec<_> = new_wants
-                        .iter()
-                        .take(3)
-                        .map(hex_encode_commit)
-                        .collect();
-                    bail!(
-                        "fetch could not converge: {} commit(s) needed but no bundle in object_index advertises them. \
-                         First missing: {}. The contract state may be inconsistent (missing bundles) \
-                         or pre-0.1.16 bundles whose objects don't include the wanted history.",
-                        new_wants.len(),
-                        sample.join(", "),
-                    );
-                }
-                wanted_commits.extend(new_wants);
-                continue;
-            }
-
-            for id in &to_download {
-                let record = state
-                    .object_index
-                    .get(id)
-                    .expect("id came from tip_to_bundle which is built from object_index");
-                let label = format!("bundle {step}");
-                let pack_bytes =
-                    download_bundle(&mut api, &pack_wasm, &env.ws_url, &record.bundle, &label)
-                        .await?;
-                install_pack(&env.git_dir, &pack_bytes)?;
-                downloaded.insert(*id);
-                step += 1;
-            }
-        }
+        let mut installer = GatewayInstaller {
+            api: &mut api,
+            pack_wasm: &pack_wasm,
+            env,
+            state: &state,
+        };
+        let all_ids: Vec<_> = state.object_index.keys().copied().collect();
+        converge_fetch(
+            &env.git_dir,
+            &tip_to_bundle,
+            &all_ids,
+            wanted_commits,
+            &mut downloaded,
+            &mut step,
+            &mut installer,
+        )
+        .await?;
 
         let total_in_index = state.object_index.len();
         let skipped = total_in_index - downloaded.len();
@@ -613,6 +577,163 @@ fn handle_fetch<W: Write>(env: &HelperEnv, wants: &[(String, String)], out: &mut
     writeln!(out)?;
     out.flush()?;
     Ok(())
+}
+
+/// Downloads and installs one bundle from the object_index. A trait so
+/// [`converge_fetch`] can be driven in tests without a gateway.
+trait BundleInstaller {
+    async fn install(&mut self, id: &freenet_git_types::ObjectBundleId, label: &str) -> Result<()>;
+}
+
+struct GatewayInstaller<'a> {
+    api: &'a mut freenet_stdlib::client_api::WebApi,
+    pack_wasm: &'a [u8],
+    env: &'a HelperEnv,
+    state: &'a RepoState,
+}
+
+impl BundleInstaller for GatewayInstaller<'_> {
+    async fn install(&mut self, id: &freenet_git_types::ObjectBundleId, label: &str) -> Result<()> {
+        let record = self
+            .state
+            .object_index
+            .get(id)
+            .expect("id came from object_index");
+        let pack_bytes = download_bundle(
+            self.api,
+            self.pack_wasm,
+            &self.env.ws_url,
+            &record.bundle,
+            label,
+        )
+        .await?;
+        install_pack(&self.env.git_dir, &pack_bytes)
+    }
+}
+
+/// What `converge_fetch` should do when commits are still missing
+/// locally and no wanted commit has an undownloaded tipped bundle.
+#[derive(Debug, PartialEq, Eq)]
+enum NextDownload {
+    /// Some missing commit is the tip of a bundle not yet downloaded.
+    DownloadTipped(Vec<freenet_git_types::ObjectBundleId>),
+    /// No missing commit is a bundle tip, but bundles remain that we
+    /// skipped. After a history-rewriting force push the needed parent
+    /// sits inside an older bundle whose tip is an abandoned commit, so
+    /// no tip matches it (#86). Download everything left.
+    DownloadRemaining(Vec<freenet_git_types::ObjectBundleId>),
+    /// Every bundle in the object_index is already downloaded and
+    /// commits are still missing: genuinely absent.
+    Stuck,
+}
+
+/// Pure decision for the "unresolved parents" step of `converge_fetch`.
+/// Ids are sorted so the order is deterministic.
+fn plan_unresolved_downloads(
+    tip_to_bundle: &std::collections::HashMap<CommitHash, freenet_git_types::ObjectBundleId>,
+    all_ids: &[freenet_git_types::ObjectBundleId],
+    downloaded: &std::collections::HashSet<freenet_git_types::ObjectBundleId>,
+    new_wants: &std::collections::HashSet<CommitHash>,
+) -> NextDownload {
+    let mut tipped: Vec<_> = new_wants
+        .iter()
+        .filter_map(|c| tip_to_bundle.get(c))
+        .copied()
+        .filter(|id| !downloaded.contains(id))
+        .collect();
+    if !tipped.is_empty() {
+        tipped.sort_unstable();
+        tipped.dedup();
+        return NextDownload::DownloadTipped(tipped);
+    }
+    let mut remaining: Vec<_> = all_ids
+        .iter()
+        .copied()
+        .filter(|id| !downloaded.contains(id))
+        .collect();
+    if remaining.is_empty() {
+        return NextDownload::Stuck;
+    }
+    remaining.sort_unstable();
+    remaining.dedup();
+    NextDownload::DownloadRemaining(remaining)
+}
+
+/// Phase 2 of fetch: iteratively download tipped bundles until every
+/// wanted commit's history is present locally. See the algorithm
+/// comment in [`handle_fetch`].
+async fn converge_fetch<I: BundleInstaller>(
+    git_dir: &std::path::Path,
+    tip_to_bundle: &std::collections::HashMap<CommitHash, freenet_git_types::ObjectBundleId>,
+    all_ids: &[freenet_git_types::ObjectBundleId],
+    mut wanted_commits: std::collections::HashSet<CommitHash>,
+    downloaded: &mut std::collections::HashSet<freenet_git_types::ObjectBundleId>,
+    step: &mut usize,
+    installer: &mut I,
+) -> Result<()> {
+    let mut walked: std::collections::HashSet<CommitHash> = std::collections::HashSet::new();
+
+    loop {
+        let to_download: Vec<_> = wanted_commits
+            .iter()
+            .filter_map(|c| tip_to_bundle.get(c))
+            .copied()
+            .filter(|id| !downloaded.contains(id))
+            .collect();
+
+        if to_download.is_empty() {
+            let new_wants = walk_unresolved_parents(git_dir, &wanted_commits, &mut walked)?;
+            if new_wants.is_empty() {
+                return Ok(());
+            }
+            match plan_unresolved_downloads(tip_to_bundle, all_ids, downloaded, &new_wants) {
+                NextDownload::DownloadTipped(_) => {
+                    // The next iteration downloads the tipped bundles.
+                    wanted_commits.extend(new_wants);
+                }
+                NextDownload::DownloadRemaining(ids) => {
+                    // Install ALL remaining bundles (sorted), not one at
+                    // a time. Finding every missing commit does not mean
+                    // every tree and blob is present: a pack built
+                    // against the old ref can omit objects reachable
+                    // from it (e.g. a blob reused from the abandoned
+                    // history), and those can live in an abandoned
+                    // bundle that no missing commit points at.
+                    eprintln!(
+                        "    {} needed commit(s) are not tipped by any bundle; \
+                         downloading {} remaining bundle(s) (history was likely rewritten by a force push)",
+                        new_wants.len(),
+                        ids.len(),
+                    );
+                    for id in &ids {
+                        let label = format!("bundle {step}");
+                        installer.install(id, &label).await?;
+                        downloaded.insert(*id);
+                        *step += 1;
+                    }
+                    wanted_commits.extend(new_wants);
+                }
+                NextDownload::Stuck => {
+                    let sample: Vec<_> = new_wants.iter().take(3).map(hex_encode_commit).collect();
+                    bail!(
+                        "fetch could not converge: {} commit(s) needed but no bundle in object_index advertises them. \
+                         First missing: {}. The contract state may be inconsistent (missing bundles) \
+                         or pre-0.1.16 bundles whose objects don't include the wanted history.",
+                        new_wants.len(),
+                        sample.join(", "),
+                    );
+                }
+            }
+            continue;
+        }
+
+        for id in &to_download {
+            let label = format!("bundle {step}");
+            installer.install(id, &label).await?;
+            downloaded.insert(*id);
+            *step += 1;
+        }
+    }
 }
 
 /// `update_seq` for `bundle-tip:<id>` extension entries.
@@ -3043,5 +3164,603 @@ mod tests {
             !commit_exists(&git_dir, &tree_sha).unwrap(),
             "a tree SHA must NOT count as a commit"
         );
+    }
+
+    // ---- converge_fetch (issue #86: clone after a history-rewriting force push) ----
+
+    /// Pack exactly the objects reachable from `include` but not from
+    /// any of `exclude`, as a real incremental push does.
+    fn pack_range(repo: &std::path::Path, include: &str, exclude: &[&str]) -> Vec<u8> {
+        pack_range_omitting(repo, include, exclude, &[])
+    }
+
+    /// Like [`pack_range`] but leaves the listed object ids out of the
+    /// pack, as a pack built with exclusions can omit objects the
+    /// receiver is assumed to hold.
+    fn pack_range_omitting(
+        repo: &std::path::Path,
+        include: &str,
+        exclude: &[&str],
+        omit: &[&str],
+    ) -> Vec<u8> {
+        let mut args = vec![
+            "rev-list".to_string(),
+            "--objects".to_string(),
+            include.to_string(),
+        ];
+        args.extend(exclude.iter().map(|e| format!("^{e}")));
+        let list = Command::new("git")
+            .current_dir(repo)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(list.status.success());
+        let mut child = Command::new("git")
+            .current_dir(repo)
+            .args(["pack-objects", "--stdout", "-q"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let keep: String = String::from_utf8(list.stdout)
+            .unwrap()
+            .lines()
+            .filter(|l| !omit.iter().any(|o| l.starts_with(o)))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(keep.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        out.stdout
+    }
+
+    /// Test installer: serves canned packs and records install order.
+    struct FakeInstaller {
+        git_dir: std::path::PathBuf,
+        packs: std::collections::HashMap<freenet_git_types::ObjectBundleId, Vec<u8>>,
+        installed: Vec<freenet_git_types::ObjectBundleId>,
+    }
+
+    impl BundleInstaller for FakeInstaller {
+        async fn install(
+            &mut self,
+            id: &freenet_git_types::ObjectBundleId,
+            _label: &str,
+        ) -> Result<()> {
+            let bytes = self.packs.get(id).expect("unknown bundle id");
+            install_pack(&self.git_dir, bytes)?;
+            self.installed.push(*id);
+            Ok(())
+        }
+    }
+
+    /// Run `converge_fetch` under a timeout so a termination regression
+    /// fails instead of hanging.
+    async fn run_converge(
+        git_dir: &std::path::Path,
+        tips: &std::collections::HashMap<CommitHash, freenet_git_types::ObjectBundleId>,
+        all_ids: &[freenet_git_types::ObjectBundleId],
+        wanted: std::collections::HashSet<CommitHash>,
+        downloaded: &mut std::collections::HashSet<freenet_git_types::ObjectBundleId>,
+        step: &mut usize,
+        installer: &mut FakeInstaller,
+    ) -> Result<()> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            converge_fetch(git_dir, tips, all_ids, wanted, downloaded, step, installer),
+        )
+        .await
+        .expect("converge_fetch did not terminate")
+    }
+
+    fn fresh_client() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let st = Command::new("git")
+            .current_dir(dir.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let git_dir = dir.path().join(".git");
+        (dir, git_dir)
+    }
+
+    fn has_commit(git_dir: &std::path::Path, sha: &str) -> bool {
+        commit_exists(git_dir, sha).unwrap()
+    }
+
+    /// Everything a force-push scenario needs: the remote's two
+    /// bundles and the commits involved.
+    struct ForcePushFixture {
+        _src: tempfile::TempDir,
+        c1: String,
+        c3: String,
+        c4: String,
+        b1_pack: Vec<u8>,
+        b2_pack: Vec<u8>,
+    }
+
+    const B1: freenet_git_types::ObjectBundleId = [1u8; 32];
+    const B2: freenet_git_types::ObjectBundleId = [2u8; 32];
+
+    /// B1 = C1..C3 tipped C3. `reset --hard HEAD~2`, commit C4, force
+    /// push: B2 = C4 alone (parent C1) tipped C4. refs: main = C4.
+    fn force_push_fixture() -> ForcePushFixture {
+        let src = tempfile::tempdir().unwrap();
+        let shas = build_linear_history(src.path(), 3).unwrap();
+        let b1_pack = pack_range(src.path(), &shas[2], &[]);
+        let st = Command::new("git")
+            .current_dir(src.path())
+            .args(["reset", "--hard", "-q", "HEAD~2"])
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let c4 = commit_in(src.path(), "c4", "b.txt", "rewritten\n", &[]).unwrap();
+        let b2_pack = pack_range(src.path(), &c4, &[&shas[2]]);
+        ForcePushFixture {
+            c1: shas[0].clone(),
+            c3: shas[2].clone(),
+            c4,
+            b1_pack,
+            b2_pack,
+            _src: src,
+        }
+    }
+
+    #[tokio::test]
+    async fn converge_fetch_recovers_parent_buried_in_untipped_bundle_after_force_push() {
+        let fx = force_push_fixture();
+        let (_client, git_dir) = fresh_client();
+        let tip_to_bundle = std::collections::HashMap::from([
+            (parse_hex_commit(&fx.c3), B1),
+            (parse_hex_commit(&fx.c4), B2),
+        ]);
+        let mut installer = FakeInstaller {
+            git_dir: git_dir.clone(),
+            packs: std::collections::HashMap::from([
+                (B1, fx.b1_pack.clone()),
+                (B2, fx.b2_pack.clone()),
+            ]),
+            installed: vec![],
+        };
+        let mut downloaded = std::collections::HashSet::new();
+        let mut step = 1usize;
+        run_converge(
+            &git_dir,
+            &tip_to_bundle,
+            &[B1, B2],
+            std::iter::once(parse_hex_commit(&fx.c4)).collect(),
+            &mut downloaded,
+            &mut step,
+            &mut installer,
+        )
+        .await
+        .expect("fetch must converge using the abandoned-tip bundle");
+        assert!(has_commit(&git_dir, &fx.c4));
+        assert!(has_commit(&git_dir, &fx.c1), "C1 lives in the B1 bundle");
+        assert_eq!(installer.installed.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn converge_fetch_errors_when_parent_is_in_no_bundle() {
+        let fx = force_push_fixture();
+        let (_client, git_dir) = fresh_client();
+        // B1 is not in the object_index at all: C1 is genuinely absent.
+        let tip_to_bundle = std::collections::HashMap::from([(parse_hex_commit(&fx.c4), B2)]);
+        let mut installer = FakeInstaller {
+            git_dir: git_dir.clone(),
+            packs: std::collections::HashMap::from([(B2, fx.b2_pack.clone())]),
+            installed: vec![],
+        };
+        let mut downloaded = std::collections::HashSet::new();
+        let mut step = 1usize;
+        let err = run_converge(
+            &git_dir,
+            &tip_to_bundle,
+            &[B2],
+            std::iter::once(parse_hex_commit(&fx.c4)).collect(),
+            &mut downloaded,
+            &mut step,
+            &mut installer,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("fetch could not converge"),
+            "{err}"
+        );
+        assert_eq!(installer.installed, vec![B2]);
+    }
+
+    #[tokio::test]
+    async fn converge_fetch_skips_dead_weight_bundle_when_history_is_complete() {
+        // Snapshot-style: B1 holds the full history tipped at C3; B2 is a
+        // dead-weight orphan remnant. The fallback must NOT fire.
+        let fx = force_push_fixture();
+        let (_client, git_dir) = fresh_client();
+        let tip_to_bundle = std::collections::HashMap::from([
+            (parse_hex_commit(&fx.c3), B1),
+            (parse_hex_commit(&fx.c4), B2),
+        ]);
+        let mut installer = FakeInstaller {
+            git_dir: git_dir.clone(),
+            packs: std::collections::HashMap::from([
+                (B1, fx.b1_pack.clone()),
+                (B2, fx.b2_pack.clone()),
+            ]),
+            installed: vec![],
+        };
+        let mut downloaded = std::collections::HashSet::new();
+        let mut step = 1usize;
+        run_converge(
+            &git_dir,
+            &tip_to_bundle,
+            &[B1, B2],
+            std::iter::once(parse_hex_commit(&fx.c3)).collect(),
+            &mut downloaded,
+            &mut step,
+            &mut installer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            installer.installed,
+            vec![B1],
+            "dead-weight B2 stays skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn converge_fetch_downloads_everything_then_errors_when_parent_still_missing() {
+        // B3 is an unrelated bundle that does not contain C1. The
+        // fallback downloads it, C1 is still missing, and the fetch
+        // fails instead of looping.
+        let fx = force_push_fixture();
+        let other = tempfile::tempdir().unwrap();
+        let other_shas = [commit_in(other.path(), "unrelated", "z.txt", "zzz\n", &[]).unwrap()];
+        let b3_pack = pack_range(other.path(), &other_shas[0], &[]);
+        const B3: freenet_git_types::ObjectBundleId = [3u8; 32];
+        let (_client, git_dir) = fresh_client();
+        let tip_to_bundle = std::collections::HashMap::from([
+            (parse_hex_commit(&fx.c4), B2),
+            (parse_hex_commit(&other_shas[0]), B3),
+        ]);
+        let mut installer = FakeInstaller {
+            git_dir: git_dir.clone(),
+            packs: std::collections::HashMap::from([(B2, fx.b2_pack.clone()), (B3, b3_pack)]),
+            installed: vec![],
+        };
+        let mut downloaded = std::collections::HashSet::new();
+        let mut step = 1usize;
+        let err = run_converge(
+            &git_dir,
+            &tip_to_bundle,
+            &[B2, B3],
+            std::iter::once(parse_hex_commit(&fx.c4)).collect(),
+            &mut downloaded,
+            &mut step,
+            &mut installer,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("fetch could not converge"),
+            "{err}"
+        );
+        assert_eq!(installer.installed, vec![B2, B3]);
+    }
+
+    #[test]
+    fn plan_unresolved_downloads_decisions() {
+        let c_a = [0xaa; 20];
+        let c_b = [0xbb; 20];
+        let tips = std::collections::HashMap::from([(c_a, B1), (c_b, B2)]);
+        let all = [B1, B2];
+        let none = std::collections::HashSet::new();
+        let wants =
+            |cs: &[CommitHash]| cs.iter().copied().collect::<std::collections::HashSet<_>>();
+
+        // A missing commit that is a bundle tip: tipped download.
+        assert_eq!(
+            plan_unresolved_downloads(&tips, &all, &none, &wants(&[c_a])),
+            NextDownload::DownloadTipped(vec![B1])
+        );
+        // Tipped bundle already downloaded and nothing else tipped: fall
+        // back to what remains.
+        let have_b1 = std::collections::HashSet::from([B1]);
+        assert_eq!(
+            plan_unresolved_downloads(&tips, &all, &have_b1, &wants(&[c_a])),
+            NextDownload::DownloadRemaining(vec![B2])
+        );
+        // Missing commit with no tip mapping: fallback downloads all.
+        assert_eq!(
+            plan_unresolved_downloads(&tips, &all, &none, &wants(&[[0xcc; 20]])),
+            NextDownload::DownloadRemaining(vec![B1, B2])
+        );
+        // Everything downloaded, still missing: stuck.
+        let have_all = std::collections::HashSet::from([B1, B2]);
+        assert_eq!(
+            plan_unresolved_downloads(&tips, &all, &have_all, &wants(&[[0xcc; 20]])),
+            NextDownload::Stuck
+        );
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let st = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?} failed");
+    }
+
+    fn id_of(n: u8) -> freenet_git_types::ObjectBundleId {
+        [n; 32]
+    }
+
+    /// A one-commit bundle unrelated to any other fixture history.
+    fn unrelated_bundle(tag: &str) -> (String, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let sha = commit_in(dir.path(), tag, "u.txt", &format!("{tag}\n"), &[]).unwrap();
+        let pack = pack_range(dir.path(), &sha, &[]);
+        (sha, pack)
+    }
+
+    fn installer_with(
+        git_dir: &std::path::Path,
+        packs: Vec<(freenet_git_types::ObjectBundleId, Vec<u8>)>,
+    ) -> FakeInstaller {
+        FakeInstaller {
+            git_dir: git_dir.to_path_buf(),
+            packs: packs.into_iter().collect(),
+            installed: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn converge_fetch_fallback_installs_every_remaining_bundle() {
+        // C1 lives in B9, which sorts after the unrelated abandoned
+        // bundles B3 and B4. Every remaining bundle is installed, B10
+        // included, since abandoned bundles may hold other needed objects.
+        let fx = force_push_fixture();
+        let (z3, p3) = unrelated_bundle("z3");
+        let (z4, p4) = unrelated_bundle("z4");
+        let (z10, p10) = unrelated_bundle("z10");
+        let (b2, b3, b4, b9, b10) = (id_of(2), id_of(3), id_of(4), id_of(9), id_of(10));
+        let tips = std::collections::HashMap::from([
+            (parse_hex_commit(&fx.c4), b2),
+            (parse_hex_commit(&fx.c3), b9),
+            (parse_hex_commit(&z3), b3),
+            (parse_hex_commit(&z4), b4),
+            (parse_hex_commit(&z10), b10),
+        ]);
+        let (_client, git_dir) = fresh_client();
+        let mut installer = installer_with(
+            &git_dir,
+            vec![
+                (b2, fx.b2_pack.clone()),
+                (b3, p3),
+                (b4, p4),
+                (b9, fx.b1_pack.clone()),
+                (b10, p10),
+            ],
+        );
+        let mut downloaded = std::collections::HashSet::new();
+        let mut step = 1usize;
+        run_converge(
+            &git_dir,
+            &tips,
+            &[b2, b3, b4, b9, b10],
+            std::iter::once(parse_hex_commit(&fx.c4)).collect(),
+            &mut downloaded,
+            &mut step,
+            &mut installer,
+        )
+        .await
+        .unwrap();
+        assert!(has_commit(&git_dir, &fx.c1));
+        assert_eq!(installer.installed, vec![b2, b3, b4, b9, b10]);
+    }
+
+    #[tokio::test]
+    async fn converge_fetch_fallback_does_not_reinstall_seeded_legacy_bundle() {
+        // L is a legacy bundle already installed in phase 1 (seeded in
+        // `downloaded`); it sorts first, so a fallback that ignored the
+        // downloaded set would pick it.
+        let fx = force_push_fixture();
+        let (_z, legacy_pack) = unrelated_bundle("legacy");
+        let (l, b1, b2) = (id_of(0), id_of(1), id_of(2));
+        let (_client, git_dir) = fresh_client();
+        install_pack(&git_dir, &legacy_pack).unwrap();
+        let tips = std::collections::HashMap::from([
+            (parse_hex_commit(&fx.c4), b2),
+            (parse_hex_commit(&fx.c3), b1),
+        ]);
+        let mut installer = installer_with(
+            &git_dir,
+            vec![
+                (l, legacy_pack),
+                (b1, fx.b1_pack.clone()),
+                (b2, fx.b2_pack.clone()),
+            ],
+        );
+        let mut downloaded = std::collections::HashSet::from([l]);
+        let mut step = 2usize;
+        run_converge(
+            &git_dir,
+            &tips,
+            &[l, b1, b2],
+            std::iter::once(parse_hex_commit(&fx.c4)).collect(),
+            &mut downloaded,
+            &mut step,
+            &mut installer,
+        )
+        .await
+        .unwrap();
+        assert!(has_commit(&git_dir, &fx.c1));
+        assert_eq!(
+            installer.installed,
+            vec![b2, b1],
+            "legacy bundle not re-installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn converge_fetch_two_successive_force_pushes_span_two_untipped_bundles() {
+        // B1: C1..C3 (tip C3). Force push to C1+D2+E (B2, tip E).
+        // Force push again, reset to D2, add F (B3, tip F). F's parent
+        // D2 is inside B2 (abandoned tip E); D2's parent C1 is inside
+        // B1 (abandoned tip C3). Neither parent is a bundle tip.
+        let src = tempfile::tempdir().unwrap();
+        let shas = build_linear_history(src.path(), 3).unwrap();
+        let b1_pack = pack_range(src.path(), &shas[2], &[]);
+        git_in(src.path(), &["reset", "--hard", "-q", &shas[0]]);
+        let d2 = commit_in(src.path(), "d2", "d.txt", "d2\n", &[]).unwrap();
+        let e = commit_in(src.path(), "e", "e.txt", "e\n", &[]).unwrap();
+        let b2_pack = pack_range(src.path(), &e, &[&shas[2]]);
+        git_in(src.path(), &["reset", "--hard", "-q", &d2]);
+        let f = commit_in(src.path(), "f", "f.txt", "f\n", &[]).unwrap();
+        let b3_pack = pack_range(src.path(), &f, &[&e]);
+
+        let (b1, b2, b3) = (id_of(1), id_of(2), id_of(3));
+        let tips = std::collections::HashMap::from([
+            (parse_hex_commit(&shas[2]), b1),
+            (parse_hex_commit(&e), b2),
+            (parse_hex_commit(&f), b3),
+        ]);
+        let (_client, git_dir) = fresh_client();
+        let mut installer =
+            installer_with(&git_dir, vec![(b1, b1_pack), (b2, b2_pack), (b3, b3_pack)]);
+        let mut downloaded = std::collections::HashSet::new();
+        let mut step = 1usize;
+        run_converge(
+            &git_dir,
+            &tips,
+            &[b1, b2, b3],
+            std::iter::once(parse_hex_commit(&f)).collect(),
+            &mut downloaded,
+            &mut step,
+            &mut installer,
+        )
+        .await
+        .unwrap();
+        assert!(has_commit(&git_dir, &d2));
+        assert!(has_commit(&git_dir, &shas[0]));
+        assert_eq!(installer.installed, vec![b3, b1, b2]);
+    }
+
+    #[tokio::test]
+    async fn converge_fetch_converges_when_wanted_is_an_annotated_tag_of_the_new_tip() {
+        // Pushes record the tag OBJECT sha as the bundle tip, and a new
+        // tag ref is packed with no `have`, so its bundle carries the tag,
+        // C4 and C1. (walk_unresolved_parents treats a present tag object
+        // whose target is absent as resolved, so a tag bundle that omitted
+        // its target would not be followed; real pushes never produce one.)
+        let fx = force_push_fixture();
+        let tag = annotated_tag(fx._src.path(), "v1", &fx.c4).unwrap();
+        let tag_pack = pack_range(fx._src.path(), &tag, &[]);
+        let (b1, b2, bt) = (id_of(1), id_of(2), id_of(5));
+        let tips = std::collections::HashMap::from([
+            (parse_hex_commit(&fx.c3), b1),
+            (parse_hex_commit(&fx.c4), b2),
+            (parse_hex_commit(&tag), bt),
+        ]);
+        let (_client, git_dir) = fresh_client();
+        let mut installer = installer_with(
+            &git_dir,
+            vec![
+                (b1, fx.b1_pack.clone()),
+                (b2, fx.b2_pack.clone()),
+                (bt, tag_pack),
+            ],
+        );
+        let mut downloaded = std::collections::HashSet::new();
+        let mut step = 1usize;
+        run_converge(
+            &git_dir,
+            &tips,
+            &[b1, b2, bt],
+            std::iter::once(parse_hex_commit(&tag)).collect(),
+            &mut downloaded,
+            &mut step,
+            &mut installer,
+        )
+        .await
+        .unwrap();
+        assert!(has_commit(&git_dir, &fx.c4));
+        assert!(has_commit(&git_dir, &fx.c1));
+        assert_eq!(installer.installed, vec![bt]);
+    }
+
+    #[tokio::test]
+    async fn converge_fetch_fallback_fetches_blob_reused_from_abandoned_bundle() {
+        // A = C0..C1. B = C2..C3, adding blob X. Force push: C4 (parent
+        // C0) reuses X, so its pack (C4 ^C3) omits X. A sorts before B.
+        // Finding every commit does not mean every blob is present.
+        let src = tempfile::tempdir().unwrap();
+        let c0 = commit_in(src.path(), "c0", "a.txt", "0\n", &[]).unwrap();
+        let c1 = commit_in(src.path(), "c1", "a.txt", "1\n", &[]).unwrap();
+        let pack_a = pack_range(src.path(), &c1, &[]);
+        let _c2 = commit_in(src.path(), "c2", "x.txt", "shared blob X\n", &[]).unwrap();
+        let c3 = commit_in(src.path(), "c3", "a.txt", "3\n", &[]).unwrap();
+        let pack_b = pack_range(src.path(), &c3, &[&c1]);
+        let x = String::from_utf8(
+            Command::new("git")
+                .current_dir(src.path())
+                .args(["rev-parse", &format!("{c3}:x.txt")])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        git_in(src.path(), &["reset", "--hard", "-q", &c0]);
+        let c4 = commit_in(src.path(), "c4", "x.txt", "shared blob X\n", &[]).unwrap();
+        // `rev-list --objects C4 ^C3` as run today still lists X, but a
+        // pack built with exclusions may omit it. Omit it here.
+        let pack_f = pack_range_omitting(src.path(), &c4, &[&c3], &[&x]);
+
+        let (a, b, f) = (id_of(1), id_of(2), id_of(3));
+        let tips = std::collections::HashMap::from([
+            (parse_hex_commit(&c1), a),
+            (parse_hex_commit(&c3), b),
+            (parse_hex_commit(&c4), f),
+        ]);
+        let (_client, git_dir) = fresh_client();
+        let mut installer = installer_with(&git_dir, vec![(a, pack_a), (b, pack_b), (f, pack_f)]);
+        let mut downloaded = std::collections::HashSet::new();
+        let mut step = 1usize;
+        run_converge(
+            &git_dir,
+            &tips,
+            &[a, b, f],
+            std::iter::once(parse_hex_commit(&c4)).collect(),
+            &mut downloaded,
+            &mut step,
+            &mut installer,
+        )
+        .await
+        .unwrap();
+        let st = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["cat-file", "-e", &x])
+            .status()
+            .unwrap();
+        assert!(st.success(), "blob X must be present");
+        let st = Command::new("git")
+            .arg("--git-dir")
+            .arg(&git_dir)
+            .args(["rev-list", "--objects", &c4])
+            .stdout(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "every object reachable from C4 must exist");
     }
 }
