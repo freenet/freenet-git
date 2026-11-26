@@ -386,6 +386,18 @@ or, if you are trying to contribute to someone else's repo, publish
 your own clone and send them the URL (see "Sending changes to a
 maintainer"). There is no shared-write mode yet; that is Phase 1.1.
 
+### `timed out waiting for GET response` during clone or fetch
+
+Each pack or chunk GET is retried on a timeout or on gateway backpressure,
+3 attempts in total by default, with a short backoff between them. On a
+slow network the clone keeps going after a retry line such as
+`chunk 2/3: GET timed out, retrying (attempt 2/3)`. Set
+`FREENET_GIT_CHUNK_RETRIES` to change the number of attempts (`1`
+disables retrying). If every attempt times out, the node or the network
+is not answering; check the node is running and try again later.
+Chunks that did arrive are cached, so a second attempt only fetches the
+rest.
+
 ### `exhausted all peers` during clone or fetch
 
 The contract is published but its pack bytes have fallen out of the
